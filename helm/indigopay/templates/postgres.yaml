@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: postgres
-  namespace: { { .Values.namespace } }
+  namespace: {{ .Values.namespace }}
 spec:
   serviceName: postgres-svc
   replicas: 1
@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: { { .Values.postgres.image } }
+          image: {{ .Values.postgres.image }}
           ports:
             - containerPort: 5432
           env:
@@ -51,13 +51,13 @@ spec:
         accessModes: ["ReadWriteOnce"]
         resources:
           requests:
-            storage: { { .Values.postgres.storage } }
+            storage: {{ .Values.postgres.storage }}
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: postgres-svc
-  namespace: { { .Values.namespace } }
+  namespace: {{ .Values.namespace }}
 spec:
   selector:
     app: postgres

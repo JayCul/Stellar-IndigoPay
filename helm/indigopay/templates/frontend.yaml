@@ -2,9 +2,9 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: frontend
-  namespace: { { .Values.namespace } }
+  namespace: {{ .Values.namespace }}
 spec:
-  replicas: { { .Values.frontend.replicas } }
+  replicas: {{ .Values.frontend.replicas }}
   selector:
     matchLabels:
       app: frontend
@@ -15,17 +15,17 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: { { .Values.frontend.image } }
+          image: {{ .Values.frontend.image }}
           imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: { { .Values.frontend.port } }
+            - containerPort: {{ .Values.frontend.port }}
           envFrom:
             - configMapRef:
                 name: stellar-indigopay-config
           readinessProbe:
             httpGet:
               path: /
-              port: { { .Values.frontend.port } }
+              port: {{ .Values.frontend.port }}
             initialDelaySeconds: 15
             periodSeconds: 10
           resources:
@@ -40,10 +40,10 @@ apiVersion: v1
 kind: Service
 metadata:
   name: frontend-svc
-  namespace: { { .Values.namespace } }
+  namespace: {{ .Values.namespace }}
 spec:
   selector:
     app: frontend
   ports:
-    - port: { { .Values.frontend.port } }
-      targetPort: { { .Values.frontend.port } }
+    - port: {{ .Values.frontend.port }}
+      targetPort: {{ .Values.frontend.port }}

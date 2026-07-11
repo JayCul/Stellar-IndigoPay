@@ -2,13 +2,13 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: stellar-indigopay-ingress
-  namespace: { { .Values.namespace } }
+  namespace: {{ .Values.namespace }}
   annotations:
     nginx.ingress.kubernetes.io/rewrite-target: /
 spec:
-  ingressClassName: { { .Values.ingress.className } }
+  ingressClassName: {{ .Values.ingress.className }}
   rules:
-    - host: { { .Values.ingress.host } }
+    - host: {{ .Values.ingress.host }}
       http:
         paths:
           - path: /api
@@ -17,11 +17,11 @@ spec:
               service:
                 name: backend-svc
                 port:
-                  number: { { .Values.backend.port } }
+                  number: {{ .Values.backend.port }}
           - path: /
             pathType: Prefix
             backend:
               service:
                 name: frontend-svc
                 port:
-                  number: { { .Values.frontend.port } }
+                  number: {{ .Values.frontend.port }}

@@ -119,11 +119,11 @@ function buildVerificationHtml({ request, adminUrl }) {
   const docsList =
     request.supportingDocuments && request.supportingDocuments.length
       ? `<ul>${request.supportingDocuments
-          .map(
-            (d) =>
-              `<li><a href="${escHtml(d.url)}">${escHtml(d.name)}</a>${d.size ? ` (${(d.size / 1024).toFixed(1)} KB)` : ""}</li>`,
-          )
-          .join("")}</ul>`
+        .map(
+          (d) =>
+            `<li><a href="${escHtml(d.url)}">${escHtml(d.name)}</a>${d.size ? ` (${(d.size / 1024).toFixed(1)} KB)` : ""}</li>`,
+        )
+        .join("")}</ul>`
       : "<p><em>No documents attached.</em></p>";
 
   return `<!DOCTYPE html>
@@ -166,8 +166,8 @@ function buildVerificationText({ request, adminUrl }) {
   const docs =
     request.supportingDocuments && request.supportingDocuments.length
       ? request.supportingDocuments
-          .map((d) => `  - ${d.name}: ${d.url}`)
-          .join("\n")
+        .map((d) => `  - ${d.name}: ${d.url}`)
+        .join("\n")
       : "  (none)";
   return [
     `New verification request — ${request.projectName}`,
