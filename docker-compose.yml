@@ -8,11 +8,11 @@ services:
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=indigopay
+      - POSTGRES_DB=stellar_indigopay
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d indigopay"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d stellar_indigopay"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -53,7 +53,7 @@ services:
       - STELLAR_NETWORK=testnet
       - HORIZON_URL=https://horizon-testnet.stellar.org
       - ALLOWED_ORIGINS=http://localhost:3000
-      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/indigopay
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/stellar_indigopay
       - REDIS_URL=redis://redis:6379
     depends_on:
       postgres:
