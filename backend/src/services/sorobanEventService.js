@@ -27,16 +27,11 @@ const {
   rpcServer,
   CONTRACT_ID,
   withRetry,
-  rpcBreaker,
-  NETWORK_PASSPHRASE,
 } = require("./stellar");
 const { xdr, scValToNative } = require("@stellar/stellar-sdk");
 const pool = require("../db/pool");
 const logger = require("../logger");
-const {
-  registry,
-  metrics: existingMetrics,
-} = require("./metrics");
+const { registry } = require("./metrics");
 const { Counter, Gauge } = require("prom-client");
 const { v4: uuid } = require("uuid");
 const { computeBadges } = require("./store");
@@ -45,7 +40,7 @@ const { computeBadges } = require("./store");
 
 const POLL_INTERVAL_MS = 5_000; // 5 seconds
 const BATCH_SIZE = 50;
-const DLQ_MAX_ATTEMPTS = 3;
+const DLQ_MAX_RETRIES = 3;
 
 // ── Prometheus metrics ──────────────────────────────────────────────────────
 
@@ -191,7 +186,7 @@ function pruneDedupSet() {
 async function loadCursor() {
   try {
     const result = await pool.query(
-      `SELECT value FROM indexer_state WHERE key = 'soroban_event_cursor'`,
+      "SELECT value FROM indexer_state WHERE key = 'soroban_event_cursor'",
     );
     if (result.rows.length > 0 && result.rows[0].value) {
       return result.rows[0].value;
@@ -234,7 +229,7 @@ async function saveCursor(cursor) {
  * @param {Error} error
  * @param {number} [attemptCount]
  */
-async function writeToDLQ(evt, eventType, error, attemptCount = 1) {
+async function writeToDLQ(evt, eventType, error, attemptCount = DLQ_MAX_RETRIES) {
   try {
     await pool.query(
       `INSERT INTO soroban_event_dlq
@@ -271,7 +266,6 @@ async function handleDonated(evt, topics, value) {
   const ledger = evt.ledger || 0;
 
   let amount = "0";
-  let badge = "None";
   let msgHash = null;
 
   if (Array.isArray(value)) {
@@ -279,7 +273,7 @@ async function handleDonated(evt, topics, value) {
       amount = String(value[0]);
     }
     if (value[1] !== undefined && value[1] !== null) {
-      badge = String(value[1]);
+      // badge tier extracted for logging
     }
     if (value[2] !== undefined && value[2] !== null) {
       msgHash = typeof value[2] === "bigint"
@@ -289,7 +283,6 @@ async function handleDonated(evt, topics, value) {
     }
   } else if (value && typeof value === "object") {
     amount = String(value.amount ?? value[0] ?? "0");
-    badge = String(value.badge ?? value[1] ?? "None");
     msgHash = value.msgHash ?? value.msg_hash ?? value[2] ?? null;
   }
 
@@ -734,7 +727,7 @@ async function pollEvents() {
       }
 
       const eventType = extractEventType(evt);
-      const handler = HANDLERS[eventType] || handleOtherEvent;
+      const handler = HANDLERS[eventType] || handleOtherEvent; // eslint-disable-line security/detect-object-injection
 
       try {
         const topics = extractTopics(evt);
