@@ -24,6 +24,8 @@ tags:
   - name: Jobs
   - name: Stats
   - name: Admin
+  - name: RateLimit
+    description: All endpoints are subject to rate limiting. See the components/responses/RateLimitExceeded response for headers and 429 response body details.
 security:
   - BearerAuth: []
 components:
@@ -128,6 +130,37 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+    RateLimitExceeded:
+      description: The request has been rate-limited. All endpoints carry rate-limit response headers (X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset) and return 429 with a Retry-After header when the limit is exceeded. See the API documentation for per-endpoint tiers.
+      headers:
+        Retry-After:
+          description: Number of seconds to wait before retrying.
+          schema:
+            type: integer
+        X-RateLimit-Limit:
+          description: Maximum requests allowed (or bucket capacity for token-bucket endpoints).
+          schema:
+            type: integer
+        X-RateLimit-Remaining:
+          description: Requests remaining in the current window (or tokens left in the bucket).
+          schema:
+            type: integer
+        X-RateLimit-Reset:
+          description: Epoch seconds when the limit resets (or next token becomes available).
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Too many requests — Try again later.
+              retryAfter:
+                type: integer
+                description: Epoch seconds after which a retry may succeed.
+                example: 1742169602
     InternalError:
       description: An unexpected server error occurred.
       content:
@@ -854,6 +887,8 @@ paths:
                     $ref: "#/components/schemas/Project"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/projects/{id}/verify:
     get:
       tags: [Projects]
@@ -910,6 +945,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
     get:
       tags: [Projects]
       summary: List campaigns for a project
@@ -974,6 +1011,8 @@ paths:
                     $ref: "#/components/schemas/Milestone"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/projects/{id}/milestones/{milestoneId}/reach:
     post:
       tags: [Projects]
@@ -1001,6 +1040,8 @@ paths:
                     $ref: "#/components/schemas/Milestone"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/projects/admin/register:
     post:
       tags: [Projects]
@@ -1023,6 +1064,8 @@ paths:
                     type: boolean
                   xdr:
                     type: string
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
         "500":
           $ref: "#/components/responses/InternalError"
   /api/projects/admin/confirm:
@@ -1047,6 +1090,8 @@ paths:
                     type: boolean
                   data:
                     $ref: "#/components/schemas/Project"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
         "500":
           $ref: "#/components/responses/InternalError"
   /api/projects/{id}:
@@ -1104,6 +1149,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/projects/{id}/matching:
     post:
       tags: [Projects]
@@ -1130,6 +1177,8 @@ paths:
                     $ref: "#/components/schemas/DonationMatch"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
     get:
       tags: [Projects]
       summary: List active matching offers for a project
@@ -1177,6 +1226,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/donations:
     post:
       tags: [Donations]
@@ -1204,6 +1255,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/donations/project/{projectId}/messages:
     get:
       tags: [Donations]
@@ -1309,6 +1362,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/profiles:
     post:
       tags: [Profiles]
@@ -1334,6 +1389,8 @@ paths:
                     $ref: "#/components/schemas/Profile"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/leaderboard:
     get:
       tags: [Leaderboard]
@@ -1383,6 +1440,8 @@ paths:
                         type: string
         "400":
           $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/notifications/follow:
     post:
       tags: [Notifications]
@@ -1410,6 +1469,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/notifications/unfollow:
     post:
       tags: [Notifications]
@@ -1433,6 +1494,8 @@ paths:
                     type: boolean
                   deleted:
                     type: boolean
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/notifications/follows:
     get:
       tags: [Notifications]
@@ -1487,6 +1550,8 @@ paths:
                     $ref: "#/components/schemas/Rating"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/ratings/pending:
     get:
       tags: [Ratings]
@@ -1541,6 +1606,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/updates/{updateId}/like:
     post:
       tags: [Updates]
@@ -1575,6 +1642,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/updates/{updateId}/likes:
     get:
       tags: [Updates]
@@ -1654,6 +1723,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/jobs/{id}:
     get:
       tags: [Jobs]
@@ -1728,6 +1799,8 @@ paths:
                 $ref: "#/components/schemas/AdminLoginResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/admin/refresh:
     post:
       tags: [Admin]
@@ -1748,6 +1821,8 @@ paths:
                 $ref: "#/components/schemas/AdminRefreshResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
   /api/admin/me:
     get:
       tags: [Admin]
