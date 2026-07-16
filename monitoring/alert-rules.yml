@@ -55,6 +55,19 @@ groups:
         annotations:
           summary: "Postgres p99 query latency above 500ms for 10m on op={{ $labels.operation }}"
 
+  - name: stellar-indigopay-backend-backup
+    interval: 30s
+    rules:
+      - alert: BackupVerificationFailed
+        expr: indigopay_backup_verification_passed == 0
+        for: 0m
+        labels:
+          severity: page
+          routing: pagerduty
+        annotations:
+          summary: "Database backup verification failed"
+          description: "The nightly backup at {{ $labels.backup_path }} failed verification. Investigate immediately — the backup may be corrupt or unrecoverable."
+
   - name: stellar-indigopay-backend-readiness
     interval: 30s
     rules:
@@ -68,3 +81,14 @@ groups:
           severity: page
         annotations:
           summary: "Backend readiness has been failing for 3m"
+
+      - alert: QueueDepthHigh
+        expr: sum by (queue) (queue_failed{job="stellar-indigopay-backend"}) > 100
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: "Queue failed jobs count is high (>100) for 10m on {{ $labels.queue }}"
+          description: |
+            There are more than 100 failed jobs in queue '{{ $labels.queue }}' for the last 10 minutes.
+            Check the worker logs.
