@@ -59,6 +59,11 @@ const {
 } = require("./services/webhookQueue");
 const { start: startPushQueue } = require("./services/pushQueue");
 const { startIndexer } = require("./services/indexerService");
+const {
+  start: startSorobanEvents,
+  stop: stopSorobanEvents,
+  getStatus: getSorobanEventStatus,
+} = require("./services/sorobanEventService");
 const lifecycle = require("./services/lifecycle");
 
 Sentry.init({
@@ -176,6 +181,21 @@ if (process.env.NODE_ENV !== "production") {
   }
 }
 
+// ── Admin event service routes ──────────────────────────────────────────────
+// Mounted BEFORE the main admin router so that /api/admin/events/* paths
+// are matched by this more-specific router instead of being intercepted
+// by the catch-all in the generic admin router.
+try {
+  const adminEventsRouter = require("./routes/admin/events");
+  app.use("/api/admin/events", adminEventsRouter);
+  app.use("/api/v1/admin/events", adminEventsRouter);
+} catch (err) {
+  logger.error(
+    { event: "route_load_failed", route: "admin/events", err: err.message },
+    "Failed to load admin events route module",
+  );
+}
+
 // ── Application routes ──────────────────────────────────────────────────────
 // Each route file is mounted under both /api and /api/v1 so that the v1
 // versioned path and the legacy unversioned path stay in lockstep.
@@ -290,6 +310,16 @@ async function startServer() {
     ),
   );
 
+  // Start the Soroban RPC event subscription service (runs alongside Horizon
+  // SSE indexer to capture contract-only events). Pass `io` so the service
+  // can emit WebSocket events for real-time frontend updates.
+  startSorobanEvents(io).catch((err) =>
+    logger.error(
+      { event: "soroban_events_startup_error", err: err.message },
+      "Soroban event service failed to start",
+    ),
+  );
+
   // The Stellar Horizon stream in the indexer holds the event loop open.
   // Register a shutdown hook so the stream is closed cleanly on SIGTERM.
   lifecycle.onShutdown(async () => {
@@ -298,6 +328,15 @@ async function startServer() {
       if (typeof indexer.stop === "function") await indexer.stop();
     } catch {
       // Indexer may already be stopped; swallow.
+    }
+  });
+
+  // Soroban event service: stop the polling loop and persist the cursor.
+  lifecycle.onShutdown(async () => {
+    try {
+      await stopSorobanEvents();
+    } catch {
+      // Service may already be stopped; swallow.
     }
   });
 
