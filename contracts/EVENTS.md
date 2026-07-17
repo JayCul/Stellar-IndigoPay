@@ -89,6 +89,46 @@ This document lists all events emitted by the Stellar IndigoPay Soroban smart co
 
 ---
 
+## 9. `camp_crt`
+
+**Description**: Emitted when the admin creates a time-bound fundraising campaign on a project.
+
+| Event Name | Topics                              | Data                                       | When Emitted                |
+| ---------- | ----------------------------------- | ------------------------------------------ | --------------------------- |
+| `camp_crt` | `["camp_crt", admin, project_id]`   | `{ "goal": i128, "deadline_ledger": u32 }` | On `create_campaign`        |
+
+---
+
+## 10. `camp_ext`
+
+**Description**: Emitted when the admin extends an active campaign deadline.
+
+| Event Name | Topics                              | Data                      | When Emitted         |
+| ---------- | ----------------------------------- | ------------------------- | -------------------- |
+| `camp_ext` | `["camp_ext", admin, project_id]`   | `{ "new_deadline": u32 }` | On `extend_campaign` |
+
+---
+
+## 11. `camp_cls`
+
+**Description**: Emitted when the admin closes a campaign (`Closed` or `Expired`).
+
+| Event Name | Topics                            | Data                         | When Emitted        |
+| ---------- | --------------------------------- | ---------------------------- | ------------------- |
+| `camp_cls` | `["camp_cls", admin, project_id]` | `{ "status": CampaignStatus }` | On `close_campaign` |
+
+---
+
+## 12. `camp_goal`
+
+**Description**: Emitted when a donation causes the campaign goal to be reached.
+
+| Event Name  | Topics                         | Data                      | When Emitted                         |
+| ----------- | ------------------------------ | ------------------------- | ------------------------------------ |
+| `camp_goal` | `["camp_goal", project_id]`    | `{ "total_raised": i128 }` | When `total_raised >= goal` on donate |
+
+---
+
 ## Usage Notes
 
 - All events follow Soroban’s standard event format: `topics: Vec<Val>`, `data: Val`.
@@ -96,4 +136,4 @@ This document lists all events emitted by the Stellar IndigoPay Soroban smart co
 - Events can be queried via Horizon or Soroban RPC tools.
 - Frontend / backend should listen to these for real-time updates, notifications, and leaderboard.
 
-**Last Updated**: June 30, 2026
+**Last Updated**: July 17, 2026
