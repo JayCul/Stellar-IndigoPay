@@ -12,6 +12,7 @@
     "lint": "eslint src/**/*.js",
     "docs": "typedoc --options typedoc.json",
     "test": "jest --maxWorkers=2",
+    "test:integration": "jest --maxWorkers=2 --testPathPattern='integration\\.test\\.js'",
     "load-test": "k6 run ../scripts/load-test.js"
   },
   "dependencies": {

@@ -21,5 +21,5 @@ module.exports = {
   transformIgnorePatterns: [
     "node_modules/(?!(uuid|@stellar/stellar-sdk|pino|pino-http|prom-client)/)",
   ],
-  testPathIgnorePatterns: ["/node_modules/", "/scripts/load-modules.js"],
+  testPathIgnorePatterns: ["/node_modules/", "/scripts/load-modules.js", "integration\\.test\\.js$"],
 };
