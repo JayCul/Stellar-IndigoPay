@@ -30,7 +30,7 @@ import type {
   MonthlySubscription,
 } from "@/utils/types";
 import { useWishlist } from "@/hooks/useWishlist";
-import { SkeletonStatCard, SkeletonDonationList } from "@/components/Skeleton";
+import DashboardSkeleton from "@/components/DashboardSkeleton";
 import { QueryErrorFallback } from "@/components/QueryErrorFallback";
 import { classifyError } from "@/lib/queryErrors";
 
@@ -247,6 +247,13 @@ export default function Dashboard() {
     w.document.close();
   };
 
+  if (loading)
+    return (
+      <div className="max-w-5xl mx-auto px-4 sm:px-6 py-10 animate-fade-in">
+        <DashboardSkeleton />
+      </div>
+    );
+
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 py-10 animate-fade-in">
       {(loadError && !loading) || isRetrying ? (
@@ -372,49 +379,41 @@ export default function Dashboard() {
 
           {/* Stats grid */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-            {loading ? (
-              <>
-                {[1, 2, 3, 4].map((i) => (
-                  <SkeletonStatCard key={i} palette="indigo" />
-                ))}
-              </>
-            ) : (
-              [
-                {
-                  icon: "💚",
-                  label: "Total Donated",
-                  value: formatXLM(totalDonated),
-                },
-                {
-                  icon: "♻️",
-                  label: "Est. CO₂ Offset",
-                  value: formatCO2(co2Estimate),
-                },
-                {
-                  icon: "🌍",
-                  label: "Projects Supported",
-                  value: projectsCount.toString(),
-                },
-                {
-                  icon: "💰",
-                  label: "XLM Balance",
-                  value: balance ? formatXLM(balance) : "—",
-                },
-              ].map((stat) => (
-                <div
-                  key={stat.label}
-                  className="card text-center shadow-sm border border-[rgba(99,102,241,0.08)] dark:border-[rgba(129,140,248,0.10)]"
-                >
-                  <p className="text-2xl mb-2">{stat.icon}</p>
-                  <p className="font-display font-bold text-[#0F172A] dark:text-[#E2E8F0] text-lg leading-tight">
-                    {stat.value}
-                  </p>
-                  <p className="text-xs text-[#64748B] dark:text-[#94A3B8] mt-1 font-body uppercase tracking-wider font-bold opacity-60">
-                    {stat.label}
-                  </p>
-                </div>
-              ))
-            )}
+            {[
+              {
+                icon: "💚",
+                label: "Total Donated",
+                value: formatXLM(totalDonated),
+              },
+              {
+                icon: "♻️",
+                label: "Est. CO₂ Offset",
+                value: formatCO2(co2Estimate),
+              },
+              {
+                icon: "🌍",
+                label: "Projects Supported",
+                value: projectsCount.toString(),
+              },
+              {
+                icon: "💰",
+                label: "XLM Balance",
+                value: balance ? formatXLM(balance) : "—",
+              },
+            ].map((stat) => (
+              <div
+                key={stat.label}
+                className="card text-center shadow-sm border border-[rgba(99,102,241,0.08)] dark:border-[rgba(129,140,248,0.10)]"
+              >
+                <p className="text-2xl mb-2">{stat.icon}</p>
+                <p className="font-display font-bold text-[#0F172A] dark:text-[#E2E8F0] text-lg leading-tight">
+                  {stat.value}
+                </p>
+                <p className="text-xs text-[#64748B] dark:text-[#94A3B8] mt-1 font-body uppercase tracking-wider font-bold opacity-60">
+                  {stat.label}
+                </p>
+              </div>
+            ))}
           </div>
 
           <Tabs
@@ -555,9 +554,7 @@ export default function Dashboard() {
                       <h2 className="font-display text-lg font-semibold text-[#0F172A] dark:text-[#E2E8F0] mb-5 flex items-center gap-2">
                         <span>📜</span> Donation History
                       </h2>
-                      {loading ? (
-                        <SkeletonDonationList rows={3} palette="indigo" />
-                      ) : donations.length === 0 ? (
+                      {donations.length === 0 ? (
                         <div className="text-center py-12">
                           <p className="text-4xl mb-3">🌱</p>
                           <p className="text-[#475569] dark:text-[#94A3B8] mb-4 font-body">

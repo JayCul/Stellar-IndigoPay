@@ -22,7 +22,7 @@ import {
 } from "@/lib/wallet";
 import type { DonorProfile, Donation, BadgeTier } from "@/utils/types";
 import { formatXLM } from "@/utils/format";
-import { SkeletonBox, SkeletonAvatar } from "@/components/Skeleton";
+import DonorProfileSkeleton from "@/components/DonorProfileSkeleton";
 import ShareButton, { donorShareText } from "@/components/ShareButton";
 import { QueryErrorFallback } from "@/components/QueryErrorFallback";
 
@@ -169,36 +169,6 @@ function ProfileNotFound({ publicKey }: { publicKey: string }) {
       <Link href="/projects" className="btn-primary text-sm">
         Browse Projects
       </Link>
-    </div>
-  );
-}
-
-// ── Skeleton loader ───────────────────────────────────────────────────────────
-
-function ProfileSkeleton() {
-  return (
-    <div className="animate-pulse pointer-events-none space-y-6 max-w-2xl mx-auto px-4 py-10">
-      <div className="flex items-center gap-4">
-        <SkeletonAvatar size="lg" palette="forest" />
-        <div className="space-y-2 flex-1">
-          <SkeletonBox className="h-5 rounded w-1/3" palette="forest" />
-          <SkeletonBox className="h-3 rounded w-1/2" palette="forest" />
-        </div>
-      </div>
-      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-        {[0, 1, 2].map((i) => (
-          <div key={i} className="stat-card h-20" />
-        ))}
-      </div>
-      <div className="card space-y-3">
-        {[0, 1, 2, 3].map((i) => (
-          <SkeletonBox
-            key={i}
-            className="h-4 rounded w-full"
-            palette="forest"
-          />
-        ))}
-      </div>
     </div>
   );
 }
@@ -541,7 +511,7 @@ export default function DonorProfilePage() {
 
   // ── Render ───────────────────────────────────────────────────────────────
 
-  if (!publicKey || loading) return <ProfileSkeleton />;
+  if (!publicKey || loading) return <DonorProfileSkeleton />;
   if (loadError || isRetrying)
     return (
       <div className="max-w-2xl mx-auto px-4 py-10">

@@ -8,10 +8,8 @@ import PageMeta from "@/components/PageMeta";
 import Link from "next/link";
 import DonateForm from "@/components/DonateForm";
 import DonationFeed from "@/components/DonationFeed";
-import ProjectProgressBar, {
-  ProjectProgressBarSkeleton,
-} from "@/components/ProjectProgressBar";
-import { SkeletonBox, SkeletonAvatar } from "@/components/Skeleton";
+import ProjectProgressBar from "@/components/ProjectProgressBar";
+import ProjectDetailSkeleton from "@/components/ProjectDetailSkeleton";
 import ToastNotification, {
   type ToastItem,
 } from "@/components/ToastNotification";
@@ -768,7 +766,7 @@ export default function ProjectDetail({ ogProject }: ProjectDetailProps) {
 
   if (loading || !project)
     return (
-      <div className="max-w-5xl mx-auto px-4 sm:px-6 py-10 animate-pulse pointer-events-none">
+      <>
         <PageMeta
           title={ogTitle}
           description={ogDescription}
@@ -776,46 +774,8 @@ export default function ProjectDetail({ ogProject }: ProjectDetailProps) {
           ogImage={ogImage}
           jsonLd={projectJsonLd || undefined}
         />
-        <SkeletonBox className="h-6 rounded w-1/4 mb-6" palette="forest" />
-        <div className="card space-y-4">
-          <div className="flex items-start gap-4 mb-5">
-            <SkeletonAvatar size="lg" palette="forest" />
-            <div className="flex-1 space-y-3">
-              <div className="flex gap-2">
-                <SkeletonBox
-                  className="h-6 rounded-full w-20"
-                  palette="forest"
-                />
-                <SkeletonBox
-                  className="h-6 rounded-full w-16"
-                  palette="forest"
-                />
-              </div>
-              <SkeletonBox className="h-8 rounded w-2/3" palette="forest" />
-              <SkeletonBox className="h-4 rounded w-1/3" palette="forest" />
-            </div>
-          </div>
-          <ProjectProgressBarSkeleton palette="forest" />
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            {[1, 2, 3].map((i) => (
-              <div key={i} className="stat-card text-center space-y-2">
-                <SkeletonBox
-                  className="h-6 rounded w-8 mx-auto"
-                  palette="forest"
-                />
-                <SkeletonBox
-                  className="h-5 rounded w-16 mx-auto"
-                  palette="forest"
-                />
-                <SkeletonBox
-                  className="h-3 rounded w-12 mx-auto"
-                  palette="forest"
-                />
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
+        <ProjectDetailSkeleton />
+      </>
     );
 
   const pct = progressPercent(project.raisedXLM, project.goalXLM);

@@ -59,8 +59,7 @@ const { AppError } = require("./errors");
 const { startTurretsServer } = require("./services/turrets");
 const { start: startSummaryQueue } = require("./services/summaryQueue");
 const { start: startProfileQueue } = require("./services/profileQueue");
-const {
-  start: startWebhookQueue,
+const { start: startWebhookQueue,
   stop: stopWebhookQueue,
 } = require("./services/webhookQueue");
 const { start: startPushQueue } = require("./services/pushQueue");
@@ -563,7 +562,7 @@ async function startServer() {
       const sorobanEvents = require("./services/sorobanEventService");
       if (typeof sorobanEvents.stop === "function") await sorobanEvents.stop();
     } catch {
-      // Service may already be stopped; swallow.
+      // Service may already be stopped or not loaded; swallow.
     }
   });
 
