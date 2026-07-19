@@ -19,6 +19,7 @@ import {
 } from "@/lib/stellar";
 import { signTransactionWithWallet } from "@/lib/wallet";
 import { recordDonation } from "@/lib/api";
+import { useRecordDonation } from "@/hooks/queries";
 import useOnlineStatus from "@/hooks/useOnlineStatus";
 import { queueDonation, syncQueuedDonations } from "@/lib/offlineDonationQueue";
 import { formatXLM, formatCO2 } from "@/utils/format";
@@ -71,6 +72,7 @@ export default function DonateForm({
   const [conversionLoading, setConversionLoading] = useState(false);
   const [conversionError, setConversionError] = useState<string | null>(null);
   const isOnline = useOnlineStatus();
+  const recordDonationMutation = useRecordDonation();
 
   useEffect(() => {
     if (!initialAmount) return;
@@ -232,7 +234,7 @@ export default function DonateForm({
         }
 
         // Still record in backend for feed/analytics
-        await recordDonation({
+        await recordDonationMutation.mutateAsync({
           projectId: project.id,
           donorAddress: publicKey,
           amount: amountNum.toString(),
@@ -283,7 +285,7 @@ export default function DonateForm({
         setTxHash(result.hash);
 
         setStep("recording");
-        await recordDonation({
+        await recordDonationMutation.mutateAsync({
           projectId: project.id,
           donorAddress: publicKey,
           amount: amountNum.toString(),
