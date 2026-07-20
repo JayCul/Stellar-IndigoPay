@@ -1,5 +1,5 @@
 import { renderHook } from "@testing-library/react";
-import { useShortcuts } from "../useShortcuts";
+import useShortcuts from "../useShortcuts";
 
 describe("useShortcuts", () => {
   let originalAddEventListener: typeof window.addEventListener;

@@ -14,6 +14,7 @@ import { PriceProvider } from "@/lib/priceContext";
 import { WalletProvider, useWallet } from "@/lib/WalletProvider";
 import { ErrorBoundary } from "@/lib/ErrorBoundary";
 import useOnlineStatus from "@/hooks/useOnlineStatus";
+import useShortcuts from "@/hooks/useShortcuts";
 import ConnectivityBanner from "@/components/ConnectivityBanner";
 import OfflineFallback from "@/components/OfflineFallback";
 import InstallPrompt from "@/components/InstallPrompt";
