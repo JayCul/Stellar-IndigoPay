@@ -272,7 +272,6 @@ pub enum DataKey {
     DonorStats(Address),
     ImpactNFT(Address, BadgeTier),
     DonationCount,
-    AnonymousDonationCount,
     DonationRecord(u32),
     GlobalTotalRaised,
     GlobalCO2OffsetGrams,
@@ -363,11 +362,34 @@ pub enum DataKey {
     VoteDelegation(Address),
     DelegatedWeight(Address),
     NativeTokenAddress,
+    // Appended to preserve the encoding of all pre-existing storage keys.
+    AnonymousDonationCount(String),
+    // Private donor reference for refund authorization. Public DonationRecord
+    // entries intentionally use the zero-address placeholder when anonymous.
+    DonationDonor(u32),
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const STROOP: i128 = 10_000_000;
+
+/// Stable placeholder used in public records and event topics for anonymous
+/// donations. The actual donor is kept only in private instance storage for
+/// refund authorization.
+fn anonymous_placeholder(env: &Env) -> Address {
+    Address::from_string(&String::from_str(
+        env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ))
+}
+
+fn public_donor(env: &Env, donor: &Address, anonymous: bool) -> Address {
+    if anonymous {
+        anonymous_placeholder(env)
+    } else {
+        donor.clone()
+    }
+}
 
 // 7 days × 24 h × 3600 s ÷ 5 s per ledger ≈ 120_960 ledgers — used as the
 // default when `create_proposal` is called without an explicit duration.
@@ -1161,7 +1183,7 @@ impl IndigoPayContract {
 
         // Anonymous donations must not accrue to the donor's publicly-queryable
         // profile. Use the non-attributable placeholder for internal badge data.
-        let stats_donor = if anonymous { Address::from_string(&String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")) } else { donor.clone() };
+        let stats_donor = public_donor(&env, &donor, anonymous);
         let mut donor_stats: DonorStats = env
             .storage()
             .instance()
@@ -1214,23 +1236,25 @@ impl IndigoPayContract {
             .expect("Donor co2_offset overflow");
         donor_stats.badge = calculate_badge(donor_stats.total_donated);
         #[cfg(feature = "delegation")]
-        update_delegated_weight_if_needed(&env, &donor, &prev_badge, &donor_stats.badge);
+        if !anonymous {
+            update_delegated_weight_if_needed(&env, &donor, &prev_badge, &donor_stats.badge);
+        }
         env.storage()
             .instance()
             .set(&DataKey::DonorStats(stats_donor.clone()), &donor_stats);
 
         // Track per-project cumulative donations for milestone NFT eligibility.
-        let proj_total_key = DataKey::DonorProjectTotal(project_id.clone(), donor.clone());
-        let prev_proj_total: i128 = env.storage().instance().get(&proj_total_key).unwrap_or(0);
-        env.storage().instance().set(
-            &proj_total_key,
-            &prev_proj_total
-                .checked_add(amount)
-                .expect("DonorProjectTotal overflow"),
-        );
+        if !anonymous {
+            let proj_total_key = DataKey::DonorProjectTotal(project_id.clone(), donor.clone());
+            let prev_proj_total: i128 = env.storage().instance().get(&proj_total_key).unwrap_or(0);
+            env.storage().instance().set(
+                &proj_total_key,
+                &prev_proj_total.checked_add(amount).expect("DonorProjectTotal overflow"),
+            );
+        }
 
         // Auto-mint an Impact NFT when a donor reaches a new badge tier.
-        if donor_stats.badge != BadgeTier::None && donor_stats.badge != prev_badge {
+        if !anonymous && donor_stats.badge != BadgeTier::None && donor_stats.badge != prev_badge {
             let nft_key = DataKey::ImpactNFT(donor.clone(), donor_stats.badge.clone());
             if !env.storage().instance().has(&nft_key) {
                 let nft = ImpactNFT {
@@ -1258,7 +1282,7 @@ impl IndigoPayContract {
             .set(&DataKey::DonationCount, &new_dc);
         // Store donation record for trustless enumeration
         let donation_record = DonationRecord {
-            donor: donor.clone(),
+            donor: public_donor(&env, &donor, anonymous),
             anonymous,
             project: project_id.clone(),
             amount,
@@ -1269,9 +1293,11 @@ impl IndigoPayContract {
         env.storage()
             .instance()
             .set(&DataKey::DonationRecord(dc), &donation_record);
+        env.storage().instance().set(&DataKey::DonationDonor(dc), &donor);
         if anonymous {
-            let count: u32 = env.storage().instance().get(&DataKey::AnonymousDonationCount).unwrap_or(0);
-            env.storage().instance().set(&DataKey::AnonymousDonationCount, &count.checked_add(1).expect("AnonymousDonationCount overflow"));
+            let key = DataKey::AnonymousDonationCount(project_id.clone());
+            let count: u32 = env.storage().instance().get(&key).unwrap_or(0);
+            env.storage().instance().set(&key, &count.checked_add(1).expect("AnonymousDonationCount overflow"));
         }
         // Snapshot CO₂ offset for exact reversal on refund (#290).
         env.storage()
@@ -1303,7 +1329,7 @@ impl IndigoPayContract {
         token_client.transfer(&donor, &project.wallet, &amount);
 
         env.events().publish(
-            (symbol_short!("donated"), if anonymous { Address::from_string(&String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")) } else { donor.clone() }, project_id.clone()),
+            (symbol_short!("donated"), public_donor(&env, &donor, anonymous), project_id.clone()),
             (amount, donor_stats.badge.clone(), msg_hash),
         );
         ensure_min_ttl(&env, VOTING_WINDOW_LEDGERS * 4);
@@ -1365,7 +1391,7 @@ impl IndigoPayContract {
             .checked_mul(project.co2_per_xlm as i128)
             .expect("CO2 calculation overflow");
 
-        let stats_donor = if anonymous { Address::from_string(&String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")) } else { donor.clone() };
+        let stats_donor = public_donor(&env, &donor, anonymous);
         let mut donor_stats: DonorStats = env
             .storage()
             .instance()
@@ -1417,23 +1443,25 @@ impl IndigoPayContract {
             .expect("Donor co2_offset overflow");
         donor_stats.badge = calculate_badge(donor_stats.total_donated);
         #[cfg(feature = "delegation")]
-        update_delegated_weight_if_needed(&env, &donor, &prev_badge, &donor_stats.badge);
+        if !anonymous {
+            update_delegated_weight_if_needed(&env, &donor, &prev_badge, &donor_stats.badge);
+        }
         env.storage()
             .instance()
             .set(&DataKey::DonorStats(stats_donor.clone()), &donor_stats);
 
         // Track per-project cumulative donations for milestone NFT eligibility.
-        let proj_total_key = DataKey::DonorProjectTotal(project_id.clone(), donor.clone());
-        let prev_proj_total: i128 = env.storage().instance().get(&proj_total_key).unwrap_or(0);
-        env.storage().instance().set(
-            &proj_total_key,
-            &prev_proj_total
-                .checked_add(xlm_amount)
-                .expect("DonorProjectTotal overflow"),
-        );
+        if !anonymous {
+            let proj_total_key = DataKey::DonorProjectTotal(project_id.clone(), donor.clone());
+            let prev_proj_total: i128 = env.storage().instance().get(&proj_total_key).unwrap_or(0);
+            env.storage().instance().set(
+                &proj_total_key,
+                &prev_proj_total.checked_add(xlm_amount).expect("DonorProjectTotal overflow"),
+            );
+        }
 
         // Auto-mint an Impact NFT when a donor reaches a new badge tier.
-        if donor_stats.badge != BadgeTier::None && donor_stats.badge != prev_badge {
+        if !anonymous && donor_stats.badge != BadgeTier::None && donor_stats.badge != prev_badge {
             let nft_key = DataKey::ImpactNFT(donor.clone(), donor_stats.badge.clone());
             if !env.storage().instance().has(&nft_key) {
                 let nft = ImpactNFT {
@@ -1461,7 +1489,7 @@ impl IndigoPayContract {
             .set(&DataKey::DonationCount, &new_dc);
         // Store donation record with the source asset code as currency
         let donation_record = DonationRecord {
-            donor: donor.clone(),
+            donor: public_donor(&env, &donor, anonymous),
             anonymous,
             project: project_id.clone(),
             amount: xlm_amount,
@@ -1472,9 +1500,11 @@ impl IndigoPayContract {
         env.storage()
             .instance()
             .set(&DataKey::DonationRecord(dc), &donation_record);
+        env.storage().instance().set(&DataKey::DonationDonor(dc), &donor);
         if anonymous {
-            let count: u32 = env.storage().instance().get(&DataKey::AnonymousDonationCount).unwrap_or(0);
-            env.storage().instance().set(&DataKey::AnonymousDonationCount, &count.checked_add(1).expect("AnonymousDonationCount overflow"));
+            let key = DataKey::AnonymousDonationCount(project_id.clone());
+            let count: u32 = env.storage().instance().get(&key).unwrap_or(0);
+            env.storage().instance().set(&key, &count.checked_add(1).expect("AnonymousDonationCount overflow"));
         }
         // Snapshot CO₂ offset for exact reversal on refund (#290).
         env.storage()
@@ -1507,7 +1537,7 @@ impl IndigoPayContract {
         // project wallet in the same Stellar transaction.
 
         env.events().publish(
-            (symbol_short!("donated"), if anonymous { Address::from_string(&String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")) } else { donor.clone() }, project_id.clone()),
+            (symbol_short!("donated"), public_donor(&env, &donor, anonymous), project_id.clone()),
             (xlm_amount, donor_stats.badge.clone(), msg_hash),
         );
         ensure_min_ttl(&env, VOTING_WINDOW_LEDGERS * 4);
@@ -1632,8 +1662,8 @@ impl IndigoPayContract {
     }
 
     /// Number of donations whose donor address is intentionally withheld.
-    pub fn get_anonymous_donation_count(env: Env) -> u32 {
-        env.storage().instance().get(&DataKey::AnonymousDonationCount).unwrap_or(0)
+    pub fn get_anonymous_donation_count(env: Env, project_id: String) -> u32 {
+        env.storage().instance().get(&DataKey::AnonymousDonationCount(project_id)).unwrap_or(0)
     }
 
     /// Returns all four global counters in a single contract call.
@@ -2233,7 +2263,7 @@ impl IndigoPayContract {
             .checked_mul(project.co2_per_xlm as i128)
             .expect("CO2 calculation overflow");
 
-        let stats_donor = if anonymous { Address::from_string(&String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")) } else { donor.clone() };
+        let stats_donor = public_donor(&env, &donor, anonymous);
         let mut donor_stats: DonorStats = env
             .storage()
             .instance()
@@ -2284,12 +2314,14 @@ impl IndigoPayContract {
             .expect("Donor co2_offset overflow");
         donor_stats.badge = calculate_badge(donor_stats.total_donated);
         #[cfg(feature = "delegation")]
-        update_delegated_weight_if_needed(&env, &donor, &prev_badge, &donor_stats.badge);
+        if !anonymous {
+            update_delegated_weight_if_needed(&env, &donor, &prev_badge, &donor_stats.badge);
+        }
         env.storage()
             .instance()
             .set(&DataKey::DonorStats(stats_donor.clone()), &donor_stats);
 
-        if donor_stats.badge != BadgeTier::None && donor_stats.badge != prev_badge {
+        if !anonymous && donor_stats.badge != BadgeTier::None && donor_stats.badge != prev_badge {
             let nft_key = DataKey::ImpactNFT(donor.clone(), donor_stats.badge.clone());
             if !env.storage().instance().has(&nft_key) {
                 let nft = ImpactNFT {
@@ -2317,7 +2349,7 @@ impl IndigoPayContract {
             .set(&DataKey::DonationCount, &new_dc);
         // Store USDC donation record for trustless enumeration
         let donation_record = DonationRecord {
-            donor: donor.clone(),
+            donor: public_donor(&env, &donor, anonymous),
             anonymous,
             project: project_id.clone(),
             amount: usdc_amount,
@@ -2328,9 +2360,11 @@ impl IndigoPayContract {
         env.storage()
             .instance()
             .set(&DataKey::DonationRecord(dc), &donation_record);
+        env.storage().instance().set(&DataKey::DonationDonor(dc), &donor);
         if anonymous {
-            let count: u32 = env.storage().instance().get(&DataKey::AnonymousDonationCount).unwrap_or(0);
-            env.storage().instance().set(&DataKey::AnonymousDonationCount, &count.checked_add(1).expect("AnonymousDonationCount overflow"));
+            let key = DataKey::AnonymousDonationCount(project_id.clone());
+            let count: u32 = env.storage().instance().get(&key).unwrap_or(0);
+            env.storage().instance().set(&key, &count.checked_add(1).expect("AnonymousDonationCount overflow"));
         }
         // Snapshot CO₂ offset for exact reversal on refund (#290).
         env.storage()
@@ -2360,21 +2394,21 @@ impl IndigoPayContract {
         );
 
         // Track per-project cumulative donations for milestone NFT eligibility.
-        let proj_total_key = DataKey::DonorProjectTotal(project_id.clone(), donor.clone());
-        let prev_proj_total: i128 = env.storage().instance().get(&proj_total_key).unwrap_or(0);
-        env.storage().instance().set(
-            &proj_total_key,
-            &prev_proj_total
-                .checked_add(xlm_equivalent)
-                .expect("DonorProjectTotal overflow"),
-        );
+        if !anonymous {
+            let proj_total_key = DataKey::DonorProjectTotal(project_id.clone(), donor.clone());
+            let prev_proj_total: i128 = env.storage().instance().get(&proj_total_key).unwrap_or(0);
+            env.storage().instance().set(
+                &proj_total_key,
+                &prev_proj_total.checked_add(xlm_equivalent).expect("DonorProjectTotal overflow"),
+            );
+        }
 
         let token_client = token::Client::new(&env, &usdc_token);
         let project_wallet = project.wallet;
         token_client.transfer(&donor, &project_wallet, &usdc_amount);
 
         env.events().publish(
-            (symbol_short!("donated"), if anonymous { Address::from_string(&String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")) } else { donor.clone() }, project_id),
+            (symbol_short!("donated"), public_donor(&env, &donor, anonymous), project_id),
             (usdc_amount, symbol_short!("USDC"), msg_hash),
         );
         ensure_min_ttl(&env, VOTING_WINDOW_LEDGERS * 4);
@@ -2920,7 +2954,12 @@ impl IndigoPayContract {
             .get(&DataKey::DonationRecord(donation_record_index))
             .expect("Donation record not found");
 
-        if record.donor != donor {
+        let recorded_donor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::DonationDonor(donation_record_index))
+            .unwrap_or(record.donor.clone());
+        if recorded_donor != donor {
             panic!("Only the donor can request a refund");
         }
 
@@ -3793,6 +3832,137 @@ mod tests {
             &100u32,
         );
         (env, cid, client, admin, pid)
+    }
+
+    fn mint_native_for_test(env: &Env, donor: &Address, amount: i128) -> Address {
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
+        StellarAssetClient::new(env, &token).mint(donor, &amount);
+        token
+    }
+
+    #[test]
+    fn anonymous_xlm_record_hides_donor_and_counts_per_project() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let donor = Address::generate(&env);
+        let amount = 25 * STROOP;
+        let token = mint_native_for_test(&env, &donor, amount);
+        client.donate_with_privacy(&token, &donor, &pid, &amount, &7u32, &true);
+
+        let record = client.get_donation_record(&0);
+        assert!(record.anonymous);
+        assert_eq!(record.donor, anonymous_placeholder(&env));
+        assert_eq!(client.get_anonymous_donation_count(&pid), 1);
+    }
+
+    #[test]
+    fn anonymous_xlm_updates_project_and_global_impact() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let donor = Address::generate(&env);
+        let amount = 12 * STROOP;
+        let token = mint_native_for_test(&env, &donor, amount);
+        client.donate_with_privacy(&token, &donor, &pid, &amount, &0u32, &true);
+
+        assert_eq!(client.get_project(&pid).total_raised, amount);
+        assert_eq!(client.get_global_total(), amount);
+        assert_eq!(client.get_global_co2(), 12 * 100);
+        assert_eq!(client.get_donation_count(), 1);
+    }
+
+    #[test]
+    fn anonymous_xlm_does_not_credit_public_donor_stats() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let donor = Address::generate(&env);
+        let amount = 15 * STROOP;
+        let token = mint_native_for_test(&env, &donor, amount);
+        client.donate_with_privacy(&token, &donor, &pid, &amount, &0u32, &true);
+
+        assert_eq!(client.get_donor_stats(&donor).total_donated, 0);
+        assert_eq!(client.get_donor_stats(&donor).donation_count, 0);
+    }
+
+    #[test]
+    fn public_xlm_donation_retains_donor_and_is_not_anonymous() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let donor = Address::generate(&env);
+        let amount = 10 * STROOP;
+        let token = mint_native_for_test(&env, &donor, amount);
+        client.donate_with_privacy(&token, &donor, &pid, &amount, &0u32, &false);
+
+        let record = client.get_donation_record(&0);
+        assert!(!record.anonymous);
+        assert_eq!(record.donor, donor);
+        assert_eq!(client.get_anonymous_donation_count(&pid), 0);
+        assert_eq!(client.get_donor_stats(&donor).total_donated, amount);
+    }
+
+    #[test]
+    fn anonymous_counts_are_scoped_to_each_project() {
+        let (env, _cid, client, admin, pid) = setup();
+        let second = String::from_str(&env, "proj-002");
+        client.register_project(&admin, &second, &String::from_str(&env, "Second"), &Address::generate(&env), &100u32);
+        let donor = Address::generate(&env);
+        let token = mint_native_for_test(&env, &donor, 20 * STROOP);
+        client.donate_with_privacy(&token, &donor, &pid, &(10 * STROOP), &0u32, &true);
+        client.donate_with_privacy(&token, &donor, &second, &(10 * STROOP), &1u32, &true);
+
+        assert_eq!(client.get_anonymous_donation_count(&pid), 1);
+        assert_eq!(client.get_anonymous_donation_count(&second), 1);
+    }
+
+    #[test]
+    fn multiple_anonymous_donations_increment_the_project_counter() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let donor = Address::generate(&env);
+        let token = mint_native_for_test(&env, &donor, 20 * STROOP);
+        client.donate_with_privacy(&token, &donor, &pid, &(10 * STROOP), &0u32, &true);
+        client.donate_with_privacy(&token, &donor, &pid, &(10 * STROOP), &1u32, &true);
+        assert_eq!(client.get_anonymous_donation_count(&pid), 2);
+    }
+
+    #[test]
+    fn public_donation_does_not_increment_anonymous_counter() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let donor = Address::generate(&env);
+        let token = mint_native_for_test(&env, &donor, 10 * STROOP);
+        client.donate_with_privacy(&token, &donor, &pid, &(10 * STROOP), &0u32, &false);
+        assert_eq!(client.get_anonymous_donation_count(&pid), 0);
+    }
+
+    #[test]
+    fn mixed_donations_preserve_project_and_global_totals() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let first = Address::generate(&env);
+        let second = Address::generate(&env);
+        let token = mint_native_for_test(&env, &first, 10 * STROOP);
+        StellarAssetClient::new(&env, &token).mint(&second, &(10 * STROOP));
+        client.donate_with_privacy(&token, &first, &pid, &(10 * STROOP), &0u32, &true);
+        client.donate_with_privacy(&token, &second, &pid, &(10 * STROOP), &1u32, &false);
+        assert_eq!(client.get_project(&pid).total_raised, 20 * STROOP);
+        assert_eq!(client.get_global_total(), 20 * STROOP);
+    }
+
+    #[test]
+    fn anonymous_record_preserves_auditable_amount_and_message_hash() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let donor = Address::generate(&env);
+        let token = mint_native_for_test(&env, &donor, 8 * STROOP);
+        client.donate_with_privacy(&token, &donor, &pid, &(8 * STROOP), &42u32, &true);
+        let record = client.get_donation_record(&0);
+        assert_eq!(record.amount, 8 * STROOP);
+        assert_eq!(record.message_hash, 42);
+        assert_eq!(record.project, pid);
+    }
+
+    #[test]
+    fn anonymous_donor_can_still_request_a_refund() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let donor = Address::generate(&env);
+        let token = mint_native_for_test(&env, &donor, 10 * STROOP);
+        client.donate_with_privacy(&token, &donor, &pid, &(10 * STROOP), &0u32, &true);
+        client.request_refund(&donor, &0u32, &token);
+        assert_eq!(client.get_refund_request(&0u32).donor, donor);
     }
 
     /// Inject a Seedling badge directly into contract storage for a voter.
