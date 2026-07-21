@@ -15,7 +15,11 @@ This document lists all events emitted by the Stellar IndigoPay Soroban smart co
 
 | Event Name | Topics                           | Data                                                     | When Emitted                  |
 | ---------- | -------------------------------- | -------------------------------------------------------- | ----------------------------- |
-| `donated`  | `["donated", donor, project_id]` | `{ "amount": u128, "badge": String, "msg_hash": Bytes }` | After successful XLM donation |
+| `donated`  | `["donated", donor_or_zero_address, project_id]` | `{ "amount": u128, "badge": String, "msg_hash": Bytes }` | After successful donation |
+
+When a donor passes `anonymous: true`, `donor_or_zero_address` is the Stellar
+zero-address placeholder (`GAAAAAAAA…WHF`). Amounts and project/global impact
+metrics remain public; public donor-profile and leaderboard projections exclude it.
 
 ---
 

@@ -123,6 +123,8 @@ pub struct ProjectInit {
 #[derive(Clone, Debug)]
 pub struct DonationRecord {
     pub donor: Address,
+    /// True when the donor opted out of public attribution.
+    pub anonymous: bool,
     pub project: String,
     pub amount: i128,
     pub ledger: u32,
@@ -270,6 +272,7 @@ pub enum DataKey {
     DonorStats(Address),
     ImpactNFT(Address, BadgeTier),
     DonationCount,
+    AnonymousDonationCount,
     DonationRecord(u32),
     GlobalTotalRaised,
     GlobalCO2OffsetGrams,
@@ -1081,13 +1084,20 @@ impl IndigoPayContract {
     // ─── Donations ────────────────────────────────────────────────────────────
 
     #[allow(clippy::too_many_arguments)]
-    pub fn donate(
+    /// Backward-compatible public donation entrypoint.
+    pub fn donate(env: Env, token: Address, donor: Address, project_id: String, amount: i128, msg_hash: u32) {
+        Self::donate_with_privacy(env, token, donor, project_id, amount, msg_hash, false)
+    }
+
+    /// Donate with an explicit public-attribution preference.
+    pub fn donate_with_privacy(
         env: Env,
         token: Address,
         donor: Address,
         project_id: String,
         amount: i128,
         msg_hash: u32,
+        anonymous: bool,
     ) {
         donor.require_auth();
         require_not_paused(&env);
@@ -1149,10 +1159,13 @@ impl IndigoPayContract {
             .checked_mul(project.co2_per_xlm as i128)
             .expect("CO2 calculation overflow");
 
+        // Anonymous donations must not accrue to the donor's publicly-queryable
+        // profile. Use the non-attributable placeholder for internal badge data.
+        let stats_donor = if anonymous { Address::from_string(&String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")) } else { donor.clone() };
         let mut donor_stats: DonorStats = env
             .storage()
             .instance()
-            .get(&DataKey::DonorStats(donor.clone()))
+            .get(&DataKey::DonorStats(stats_donor.clone()))
             .unwrap_or(DonorStats {
                 total_donated: 0,
                 donation_count: 0,
@@ -1204,7 +1217,7 @@ impl IndigoPayContract {
         update_delegated_weight_if_needed(&env, &donor, &prev_badge, &donor_stats.badge);
         env.storage()
             .instance()
-            .set(&DataKey::DonorStats(donor.clone()), &donor_stats);
+            .set(&DataKey::DonorStats(stats_donor.clone()), &donor_stats);
 
         // Track per-project cumulative donations for milestone NFT eligibility.
         let proj_total_key = DataKey::DonorProjectTotal(project_id.clone(), donor.clone());
@@ -1246,6 +1259,7 @@ impl IndigoPayContract {
         // Store donation record for trustless enumeration
         let donation_record = DonationRecord {
             donor: donor.clone(),
+            anonymous,
             project: project_id.clone(),
             amount,
             ledger: env.ledger().sequence(),
@@ -1255,6 +1269,10 @@ impl IndigoPayContract {
         env.storage()
             .instance()
             .set(&DataKey::DonationRecord(dc), &donation_record);
+        if anonymous {
+            let count: u32 = env.storage().instance().get(&DataKey::AnonymousDonationCount).unwrap_or(0);
+            env.storage().instance().set(&DataKey::AnonymousDonationCount, &count.checked_add(1).expect("AnonymousDonationCount overflow"));
+        }
         // Snapshot CO₂ offset for exact reversal on refund (#290).
         env.storage()
             .instance()
@@ -1285,7 +1303,7 @@ impl IndigoPayContract {
         token_client.transfer(&donor, &project.wallet, &amount);
 
         env.events().publish(
-            (symbol_short!("donated"), donor.clone(), project_id.clone()),
+            (symbol_short!("donated"), if anonymous { Address::from_string(&String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")) } else { donor.clone() }, project_id.clone()),
             (amount, donor_stats.badge.clone(), msg_hash),
         );
         ensure_min_ttl(&env, VOTING_WINDOW_LEDGERS * 4);
@@ -1307,13 +1325,20 @@ impl IndigoPayContract {
     ///
     /// `source_asset_code` is a short symbol identifying the source asset
     /// (e.g. "yXLM", "USDT", "BTC") for the on-chain donation record.
-    pub fn donate_asset(
+    /// Backward-compatible path-payment entrypoint.
+    pub fn donate_asset(env: Env, donor: Address, project_id: String, xlm_amount: i128, source_asset_code: Symbol, msg_hash: u32) {
+        Self::donate_asset_with_privacy(env, donor, project_id, xlm_amount, source_asset_code, msg_hash, false)
+    }
+
+    /// Record a path-payment donation with an attribution preference.
+    pub fn donate_asset_with_privacy(
         env: Env,
         donor: Address,
         project_id: String,
         xlm_amount: i128,
         source_asset_code: Symbol,
         msg_hash: u32,
+        anonymous: bool,
     ) {
         donor.require_auth();
         require_not_paused(&env);
@@ -1340,10 +1365,11 @@ impl IndigoPayContract {
             .checked_mul(project.co2_per_xlm as i128)
             .expect("CO2 calculation overflow");
 
+        let stats_donor = if anonymous { Address::from_string(&String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")) } else { donor.clone() };
         let mut donor_stats: DonorStats = env
             .storage()
             .instance()
-            .get(&DataKey::DonorStats(donor.clone()))
+            .get(&DataKey::DonorStats(stats_donor.clone()))
             .unwrap_or(DonorStats {
                 total_donated: 0,
                 donation_count: 0,
@@ -1394,7 +1420,7 @@ impl IndigoPayContract {
         update_delegated_weight_if_needed(&env, &donor, &prev_badge, &donor_stats.badge);
         env.storage()
             .instance()
-            .set(&DataKey::DonorStats(donor.clone()), &donor_stats);
+            .set(&DataKey::DonorStats(stats_donor.clone()), &donor_stats);
 
         // Track per-project cumulative donations for milestone NFT eligibility.
         let proj_total_key = DataKey::DonorProjectTotal(project_id.clone(), donor.clone());
@@ -1436,6 +1462,7 @@ impl IndigoPayContract {
         // Store donation record with the source asset code as currency
         let donation_record = DonationRecord {
             donor: donor.clone(),
+            anonymous,
             project: project_id.clone(),
             amount: xlm_amount,
             ledger: env.ledger().sequence(),
@@ -1445,6 +1472,10 @@ impl IndigoPayContract {
         env.storage()
             .instance()
             .set(&DataKey::DonationRecord(dc), &donation_record);
+        if anonymous {
+            let count: u32 = env.storage().instance().get(&DataKey::AnonymousDonationCount).unwrap_or(0);
+            env.storage().instance().set(&DataKey::AnonymousDonationCount, &count.checked_add(1).expect("AnonymousDonationCount overflow"));
+        }
         // Snapshot CO₂ offset for exact reversal on refund (#290).
         env.storage()
             .instance()
@@ -1476,7 +1507,7 @@ impl IndigoPayContract {
         // project wallet in the same Stellar transaction.
 
         env.events().publish(
-            (symbol_short!("donated"), donor.clone(), project_id.clone()),
+            (symbol_short!("donated"), if anonymous { Address::from_string(&String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")) } else { donor.clone() }, project_id.clone()),
             (xlm_amount, donor_stats.badge.clone(), msg_hash),
         );
         ensure_min_ttl(&env, VOTING_WINDOW_LEDGERS * 4);
@@ -1598,6 +1629,11 @@ impl IndigoPayContract {
             .instance()
             .get(&DataKey::DonationCount)
             .unwrap_or(0)
+    }
+
+    /// Number of donations whose donor address is intentionally withheld.
+    pub fn get_anonymous_donation_count(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::AnonymousDonationCount).unwrap_or(0)
     }
 
     /// Returns all four global counters in a single contract call.
@@ -2134,13 +2170,22 @@ impl IndigoPayContract {
 
     /// Donate USDC. Converts to XLM-equivalent for global stats using a price oracle stub.
     #[cfg(feature = "usdc")]
-    pub fn donate_usdc(
+    /// Backward-compatible USDC entrypoint.
+    #[cfg(feature = "usdc")]
+    pub fn donate_usdc(env: Env, usdc_token: Address, donor: Address, project_id: String, usdc_amount: i128, msg_hash: u32) {
+        Self::donate_usdc_with_privacy(env, usdc_token, donor, project_id, usdc_amount, msg_hash, false)
+    }
+
+    /// Donate USDC with an explicit public-attribution preference.
+    #[cfg(feature = "usdc")]
+    pub fn donate_usdc_with_privacy(
         env: Env,
         usdc_token: Address,
         donor: Address,
         project_id: String,
         usdc_amount: i128,
         msg_hash: u32,
+        anonymous: bool,
     ) {
         donor.require_auth();
         require_not_paused(&env);
@@ -2188,10 +2233,11 @@ impl IndigoPayContract {
             .checked_mul(project.co2_per_xlm as i128)
             .expect("CO2 calculation overflow");
 
+        let stats_donor = if anonymous { Address::from_string(&String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")) } else { donor.clone() };
         let mut donor_stats: DonorStats = env
             .storage()
             .instance()
-            .get(&DataKey::DonorStats(donor.clone()))
+            .get(&DataKey::DonorStats(stats_donor.clone()))
             .unwrap_or(DonorStats {
                 total_donated: 0,
                 donation_count: 0,
@@ -2241,7 +2287,7 @@ impl IndigoPayContract {
         update_delegated_weight_if_needed(&env, &donor, &prev_badge, &donor_stats.badge);
         env.storage()
             .instance()
-            .set(&DataKey::DonorStats(donor.clone()), &donor_stats);
+            .set(&DataKey::DonorStats(stats_donor.clone()), &donor_stats);
 
         if donor_stats.badge != BadgeTier::None && donor_stats.badge != prev_badge {
             let nft_key = DataKey::ImpactNFT(donor.clone(), donor_stats.badge.clone());
@@ -2272,6 +2318,7 @@ impl IndigoPayContract {
         // Store USDC donation record for trustless enumeration
         let donation_record = DonationRecord {
             donor: donor.clone(),
+            anonymous,
             project: project_id.clone(),
             amount: usdc_amount,
             ledger: env.ledger().sequence(),
@@ -2281,6 +2328,10 @@ impl IndigoPayContract {
         env.storage()
             .instance()
             .set(&DataKey::DonationRecord(dc), &donation_record);
+        if anonymous {
+            let count: u32 = env.storage().instance().get(&DataKey::AnonymousDonationCount).unwrap_or(0);
+            env.storage().instance().set(&DataKey::AnonymousDonationCount, &count.checked_add(1).expect("AnonymousDonationCount overflow"));
+        }
         // Snapshot CO₂ offset for exact reversal on refund (#290).
         env.storage()
             .instance()
@@ -2323,7 +2374,7 @@ impl IndigoPayContract {
         token_client.transfer(&donor, &project_wallet, &usdc_amount);
 
         env.events().publish(
-            (symbol_short!("donated"), donor.clone(), project_id),
+            (symbol_short!("donated"), if anonymous { Address::from_string(&String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")) } else { donor.clone() }, project_id),
             (usdc_amount, symbol_short!("USDC"), msg_hash),
         );
         ensure_min_ttl(&env, VOTING_WINDOW_LEDGERS * 4);
@@ -3353,6 +3404,7 @@ impl IndigoPayContract {
 
         let donation_record = DonationRecord {
             donor: donor.clone(),
+            anonymous: false,
             project: recurring.project_id.clone(),
             amount: recurring.amount,
             ledger: env.ledger().sequence(),
