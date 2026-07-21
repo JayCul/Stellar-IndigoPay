@@ -15,6 +15,7 @@ import {
 import { signTransactionWithWallet } from "@/lib/wallet";
 import { shortenAddress, formatXLM } from "@/utils/format";
 import type { EscrowJob } from "@/utils/types";
+import JobDetailSkeleton from "@/components/JobDetailSkeleton";
 
 interface JobPageProps {
   publicKey: string | null;
@@ -136,11 +137,7 @@ export default function JobDetailPage({ publicKey, onConnect }: JobPageProps) {
   };
 
   if (!router.isReady || loading) {
-    return (
-      <div className="max-w-3xl mx-auto px-4 py-16 text-center text-[#5a7a5a] dark:text-[#8aaa8a] font-body">
-        Loading job…
-      </div>
-    );
+    return <JobDetailSkeleton />;
   }
 
   if (!jobId || loadError || !job) {

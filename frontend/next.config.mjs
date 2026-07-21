@@ -1,4 +1,9 @@
 import { withSentryConfig } from "@sentry/nextjs";
+import withBundleAnalyzer from "@next/bundle-analyzer";
+
+const withBundleAnalyzerConfig = withBundleAnalyzer({
+  enabled: process.env.ANALYZE === "true",
+});
 
 /** @type {import('next').NextConfig} */
 
@@ -53,7 +58,7 @@ function buildStaticCsp(allowFraming = false) {
     "font-src 'self' https://fonts.gstatic.com",
     // OSM tiles loaded as images; Leaflet marker icons use data: URIs.
     `img-src 'self' data: blob: ${LEAFLET_TILE_SOURCES}`,
-    `connect-src 'self' ${STELLAR_CONNECT} https://api.coingecko.com`,
+    `connect-src 'self' ${STELLAR_CONNECT} https://api.coingecko.com ${process.env.NEXT_PUBLIC_API_URL ? process.env.NEXT_PUBLIC_API_URL : ''}`,
     "object-src 'none'",
     "base-uri 'self'",
     "form-action 'self'",
@@ -64,6 +69,17 @@ function buildStaticCsp(allowFraming = false) {
 
 const nextConfig = {
   reactStrictMode: true,
+  experimental: {
+    optimizePackageImports: ["@sentry/nextjs"],
+  },
+  images: {
+    remotePatterns: [
+      { protocol: "https", hostname: "**.stellar.org" },
+      { protocol: "https", hostname: "**.indigopay.com" },
+      { protocol: "http", hostname: "localhost" },
+    ],
+    formats: ["image/avif", "image/webp"],
+  },
   webpack: (config) => {
     config.resolve.fallback = {
       ...config.resolve.fallback,
@@ -93,13 +109,12 @@ const nextConfig = {
       },
       {
         // Widget pages are intentionally embeddable by third-party sites.
-        // Override frame-ancestors and X-Frame-Options for this route.
+        // Override frame-ancestors to allow cross-origin framing (issue #74).
+        // X-Frame-Options is omitted by not including it in this header set;
+        // modern browsers respect CSP frame-ancestors * instead.
         source: "/widget/:path*",
         headers: [
           { key: "Content-Security-Policy", value: buildStaticCsp(true) },
-          // X-Frame-Options has no "allow all" value; rely on CSP frame-ancestors
-          // for modern browsers and omit the legacy header for widget routes.
-          { key: "X-Frame-Options", value: "SAMEORIGIN" },
         ],
       },
     ];
@@ -129,7 +144,8 @@ const nextConfig = {
 // printing Sentry output in CI.
 const hasSentryAuth = Boolean(process.env.SENTRY_AUTH_TOKEN);
 
-export default withSentryConfig(
+export default withBundleAnalyzerConfig(
+  withSentryConfig(
   nextConfig,
   // Second arg: Sentry webpack plugin options (source-map upload config)
   {
@@ -151,4 +167,5 @@ export default withSentryConfig(
     disableServerWebpackPlugin: !hasSentryAuth,
     disableClientWebpackPlugin: !hasSentryAuth,
   },
+  ),
 );

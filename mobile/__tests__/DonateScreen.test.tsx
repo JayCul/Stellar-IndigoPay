@@ -38,31 +38,45 @@ const LA = LocalAuthentication as unknown as {
 // inspect whether `authenticate` was called.
 jest.mock("../hooks/useBiometricAuth", () => {
   const state = {
+    isAvailable: true,
+    biometricType: "Biometrics",
+    threshold: 1,
+    isEnabled: true,
+    isAuthenticating: false,
+    confirmDonation: jest.fn().mockResolvedValue({ success: true }),
+    setBiometricThreshold: jest.fn(),
+    setIsEnabled: jest.fn(),
+    // Compatibility fields
     available: true,
     enrolled: true,
-    isAuthenticating: false,
-    lastResult: null as null | { success: boolean; outcome: string },
     label: "Biometrics",
     authenticate: jest.fn(),
     refresh: jest.fn(),
+    lastResult: null as { success: boolean; error?: string } | null,
   };
   return {
     __esModule: true,
     useBiometricAuth: () => state,
-    authenticate: jest.fn(),
   };
 });
 
 import { useBiometricAuth } from "../hooks/useBiometricAuth";
 
 const bioMock = useBiometricAuth as unknown as () => {
+  isAvailable: boolean;
+  biometricType: string | null;
+  threshold: number;
+  isEnabled: boolean;
+  isAuthenticating: boolean;
+  confirmDonation: jest.Mock;
+  setBiometricThreshold: jest.Mock;
+  setIsEnabled: jest.Mock;
+  // Compatibility fields
   available: boolean;
   enrolled: boolean;
-  isAuthenticating: boolean;
-  lastResult: null | { success: boolean; outcome: string };
   label: string;
   authenticate: jest.Mock;
-  refresh: jest.Mock;
+  lastResult: { success: boolean; error?: string } | null;
 };
 
 // Stub theme so the donate screen doesn't pull in the full
@@ -182,13 +196,12 @@ describe("DonateScreen – biometric auth gate (issue #481)", () => {
     fireEvent.press(getByText("10 XLM"));
     fireEvent.press(getByText(/🌱 Donate/));
 
-    expect(bioMock().authenticate).not.toHaveBeenCalled();
+    expect(bioMock().confirmDonation).not.toHaveBeenCalled();
   });
 
   it("calls authenticate after wallet + secret + matching keypair", async () => {
-    bioMock().authenticate.mockResolvedValue({
+    bioMock().confirmDonation.mockResolvedValue({
       success: true,
-      outcome: "success",
     });
 
     // Drive the happy path by mocking useBiometricAuth side-effects.
@@ -202,7 +215,7 @@ describe("DonateScreen – biometric auth gate (issue #481)", () => {
     );
 
     fireEvent.press(getByText(/🌱 Donate/));
-    expect(bioMock().authenticate).not.toHaveBeenCalled();
+    expect(bioMock().confirmDonation).not.toHaveBeenCalled();
   });
 
   it("invokes useBiometricAuth.authenticate from the donate flow before any submission", () => {
@@ -227,6 +240,6 @@ describe("DonateScreen – biometric auth gate (issue #481)", () => {
       expect(getByText("Donate to Amazon Reforestation")).toBeTruthy(),
     );
     // 🔒 is rendered in the bio hint row
-    expect(getByText("🔒")).toBeTruthy();
+    expect(getByText("🔒", { includeHiddenElements: true })).toBeTruthy();
   });
 });
