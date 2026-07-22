@@ -30,12 +30,9 @@ pub mod donation;
  *     --source alice --network testnet
  */
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, symbol_short, token, Address, BytesN,
-    Env, String, Symbol, Vec,
+    contract, contractclient, contractimpl, contracttype, symbol_short, token, Address, Bytes,
+    BytesN, Env, String, Symbol, Vec,
 };
-
-#[cfg(feature = "zk")]
-use soroban_sdk::Bytes;
 
 // ─── Oracle interface ─────────────────────────────────────────────────────────
 
@@ -279,6 +276,26 @@ pub struct VestingSchedule {
     pub token: Address,
 }
 
+/// An on-chain impact certificate leaf for a single donor's contribution.
+/// The platform constructs a Merkle tree of all donor impacts for a project's
+/// reporting period and posts only the root on-chain. Individual donors can then
+/// prove their specific impact (trees planted, CO₂ sequestered, hectares restored)
+/// against that root without revealing other donors' data.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImpactLeaf {
+    /// Donor address whose impact this leaf represents.
+    pub donor: Address,
+    /// Index of the donation within the project's donation history.
+    pub donation_index: u32,
+    /// CO₂ offset in kilograms attributable to this donor.
+    pub co2_kg: u32,
+    /// Number of trees planted attributable to this donor.
+    pub trees: u32,
+    /// Hectares restored attributable to this donor.
+    pub hectares: u32,
+}
+
 #[contracttype]
 pub enum DataKey {
     // Multi-sig admin set: Vec<Address> of authorized admin addresses.
@@ -394,6 +411,10 @@ pub enum DataKey {
     PlatformFeeBps,
     /// Designated wallet that receives the platform fee.
     PlatformTreasury,
+    // On-chain Impact Certificates (#382)
+    /// Merkle root of project impact report.
+    /// Key: (project_id, report_id) → BytesN<32>.
+    ImpactMerkleRoot(String, String),
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -513,6 +534,52 @@ fn require_not_paused(env: &Env) {
     if paused {
         panic!("Contract is paused");
     }
+}
+
+// ─── Merkle Proof Verification for Impact Certificates (#382) ──────────────
+
+/// Verify a Merkle proof against a known root using SHA-256.
+///
+/// Walks up the Merkle tree from `leaf` through each sibling in `proof`,
+/// re-hashing with SHA-256 at each level. The `index` determines sibling
+/// ordering: even indices put the current hash first, odd indices put the
+/// sibling first.
+///
+/// Returns `true` if the computed root matches the expected `root`.
+fn verify_merkle_proof(
+    env: &Env,
+    leaf: &BytesN<32>,
+    proof: &Vec<BytesN<32>>,
+    root: &BytesN<32>,
+    index: u32,
+) -> bool {
+    let mut hash: BytesN<32> = leaf.clone();
+    let mut idx = index;
+    for sibling in proof.iter() {
+        let mut combined = [0u8; 64];
+        if idx.is_multiple_of(2) {
+            combined[..32].copy_from_slice(&hash.to_array());
+            combined[32..].copy_from_slice(&sibling.to_array());
+        } else {
+            combined[..32].copy_from_slice(&sibling.to_array());
+            combined[32..].copy_from_slice(&hash.to_array());
+        }
+        hash = env
+            .crypto()
+            .sha256(&Bytes::from_slice(env, &combined))
+            .into();
+        idx /= 2;
+    }
+    hash == *root
+}
+
+/// Compute the leaf hash for an ImpactLeaf using deterministic XDR serialization
+/// followed by SHA-256. The off-chain Merkle tree builder MUST use the same
+/// serialization to produce the proof.
+fn compute_impact_leaf_hash(env: &Env, leaf: &ImpactLeaf) -> BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
+    let xdr_bytes = leaf.to_xdr(env);
+    env.crypto().sha256(&xdr_bytes).into()
 }
 
 /// Read the configured platform fee in basis points.
@@ -1653,6 +1720,18 @@ impl IndigoPayContract {
         env.storage().instance().get(&DataKey::ZkVerificationKey)
     }
 
+    /// Query the stored impact Merkle root for a project's impact report.
+    /// Returns `None` if no root has been posted for this project/report pair.
+    pub fn get_impact_merkle_root(
+        env: Env,
+        project_id: String,
+        report_id: String,
+    ) -> Option<BytesN<32>> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ImpactMerkleRoot(project_id, report_id))
+    }
+
     /// Anonymous donation via zk-SNARK proof verification.
     ///
     /// A donor generates a Groth16 proof off-chain proving they have sufficient
@@ -1936,6 +2015,93 @@ impl IndigoPayContract {
     #[cfg(feature = "zk")]
     pub fn is_nullifier_spent(env: Env, nullifier: BytesN<32>) -> bool {
         env.storage().instance().has(&DataKey::Nullifier(nullifier))
+    }
+
+    // ─── On-chain Impact Certificates (#382) ────────────────────────────────
+
+    /// Admin-only: post a Merkle root for a project's impact report.
+    ///
+    /// The Merkle tree of all donor impacts for the reporting period
+    /// is constructed off-chain by the backend. Only the root is stored
+    /// on-chain, enabling any donor to verify their individual impact
+    /// leaf against it via `verify_impact` without revealing other donors'
+    /// data.
+    ///
+    /// # Parameters
+    /// - `admin`: A registered admin address (requires `require_auth`).
+    /// - `project_id`: The project this report belongs to.
+    /// - `merkle_root`: The 32-byte Merkle root computed off-chain.
+    /// - `report_id`: A human-readable report identifier (e.g. "Q1 2026").
+    ///
+    /// # Panics
+    /// - If the caller is not an admin.
+    /// - If the contract is paused.
+    /// - If the project does not exist.
+    pub fn set_impact_merkle_root(
+        env: Env,
+        admin: Address,
+        project_id: String,
+        merkle_root: BytesN<32>,
+        report_id: String,
+    ) {
+        require_admin_for_routine(&env, &admin);
+        require_not_paused(&env);
+        // Verify the project exists so we don't store roots for phantom projects.
+        env.storage()
+            .instance()
+            .get::<_, Project>(&DataKey::Project(project_id.clone()))
+            .expect("Project not found");
+
+        env.storage().instance().set(
+            &DataKey::ImpactMerkleRoot(project_id.clone(), report_id.clone()),
+            &merkle_root,
+        );
+
+        env.events().publish(
+            (symbol_short!("impact_rt"), admin, project_id, report_id),
+            merkle_root,
+        );
+        ensure_min_ttl(&env, VOTING_WINDOW_LEDGERS * 4);
+    }
+
+    /// Public read-only: verify a donor's impact claim against a stored Merkle root.
+    ///
+    /// Any caller (donor, auditor, third party) can invoke this function to
+    /// cryptographically verify that the platform's claimed impact for a
+    /// specific donor matches the on-chain Merkle root. No authorization is
+    /// required — only the mathematical correctness of the proof.
+    ///
+    /// # Parameters
+    /// - `project_id`: The project the impact report belongs to.
+    /// - `report_id`: The report identifier (must match what was passed to
+    ///   `set_impact_merkle_root`).
+    /// - `impact_data`: The `ImpactLeaf` claimed for this donor.
+    /// - `proof`: The Merkle proof (list of sibling hashes) from the leaf to
+    ///   the root.
+    /// - `leaf_index`: The position of this leaf within the Merkle tree
+    ///   (used to determine sibling ordering).
+    ///
+    /// # Returns
+    /// - `true` if the proof is valid and the computed root matches the stored root.
+    /// - `false` if the Merkle root has not been posted for this project/report,
+    ///   or the proof does not verify.
+    pub fn verify_impact(
+        env: Env,
+        project_id: String,
+        report_id: String,
+        impact_data: ImpactLeaf,
+        proof: Vec<BytesN<32>>,
+        leaf_index: u32,
+    ) -> bool {
+        let key = DataKey::ImpactMerkleRoot(project_id, report_id);
+        let stored_root: Option<BytesN<32>> = env.storage().instance().get(&key);
+        let stored_root = match stored_root {
+            Some(r) => r,
+            None => return false,
+        };
+
+        let leaf_hash = compute_impact_leaf_hash(&env, &impact_data);
+        verify_merkle_proof(&env, &leaf_hash, &proof, &stored_root, leaf_index)
     }
 
     // ─── Getters ─────────────────────────────────────────────────────────────
@@ -7735,5 +7901,366 @@ mod tests {
         assert_eq!(p.total_raised, amount);
         let record = client.get_donation_record(&0u32);
         assert_eq!(record.amount, amount);
+    }
+
+    // ─── On-chain Impact Certificates (#382) ────────────────────────────────
+
+    /// Helper: compute the Merkle root for two leaves at indices 0 and 1.
+    /// Used to build a known-good test root from ImpactLeaf values.
+    fn build_two_leaf_root(env: &Env, leaf0: &ImpactLeaf, leaf1: &ImpactLeaf) -> BytesN<32> {
+        let hash0 = compute_impact_leaf_hash(env, leaf0);
+        let hash1 = compute_impact_leaf_hash(env, leaf1);
+        let mut combined = [0u8; 64];
+        combined[..32].copy_from_slice(&hash0.to_array());
+        combined[32..].copy_from_slice(&hash1.to_array());
+        env.crypto()
+            .sha256(&Bytes::from_slice(env, &combined))
+            .into()
+    }
+
+    /// Helper: build a proof for leaf at index 0 in a two-leaf tree.
+    fn build_proof_for_leaf0(env: &Env, leaf1: &ImpactLeaf) -> Vec<BytesN<32>> {
+        let mut proof = Vec::new(env);
+        proof.push_back(compute_impact_leaf_hash(env, leaf1));
+        proof
+    }
+
+    #[test]
+    fn test_merkle_proof_verification_valid() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, IndigoPayContract);
+        let client = IndigoPayContractClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&signers1(&env, &admin), &1u32);
+
+        let project_wallet = Address::generate(&env);
+        let project_id = String::from_str(&env, "forest-restore");
+        client.register_project(
+            &admin,
+            &project_id,
+            &String::from_str(&env, "Forest Restore"),
+            &project_wallet,
+            &100u32,
+        );
+
+        let donor_a = Address::generate(&env);
+        let donor_b = Address::generate(&env);
+
+        let leaf_a = ImpactLeaf {
+            donor: donor_a.clone(),
+            donation_index: 0u32,
+            co2_kg: 100u32,
+            trees: 5u32,
+            hectares: 2u32,
+        };
+        let leaf_b = ImpactLeaf {
+            donor: donor_b.clone(),
+            donation_index: 1u32,
+            co2_kg: 200u32,
+            trees: 10u32,
+            hectares: 4u32,
+        };
+
+        let root = build_two_leaf_root(&env, &leaf_a, &leaf_b);
+        let proof = build_proof_for_leaf0(&env, &leaf_b);
+
+        let report_id = String::from_str(&env, "Q1 2026");
+        client.set_impact_merkle_root(&admin, &project_id, &root, &report_id);
+
+        // Donor A's impact should verify with the correct proof.
+        let result = client.verify_impact(&project_id, &report_id, &leaf_a, &proof, &0u32);
+        assert!(result);
+    }
+
+    #[test]
+    fn test_merkle_proof_verification_invalid() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, IndigoPayContract);
+        let client = IndigoPayContractClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&signers1(&env, &admin), &1u32);
+
+        let project_wallet = Address::generate(&env);
+        let project_id = String::from_str(&env, "forest-restore");
+        client.register_project(
+            &admin,
+            &project_id,
+            &String::from_str(&env, "Forest Restore"),
+            &project_wallet,
+            &100u32,
+        );
+
+        let donor_a = Address::generate(&env);
+        let donor_b = Address::generate(&env);
+        let donor_c = Address::generate(&env);
+
+        let leaf_a = ImpactLeaf {
+            donor: donor_a.clone(),
+            donation_index: 0u32,
+            co2_kg: 100u32,
+            trees: 5u32,
+            hectares: 2u32,
+        };
+        let leaf_b = ImpactLeaf {
+            donor: donor_b.clone(),
+            donation_index: 1u32,
+            co2_kg: 200u32,
+            trees: 10u32,
+            hectares: 4u32,
+        };
+
+        let root = build_two_leaf_root(&env, &leaf_a, &leaf_b);
+        let report_id = String::from_str(&env, "Q1 2026");
+        client.set_impact_merkle_root(&admin, &project_id, &root, &report_id);
+
+        // Create a different leaf for donor C (not in the tree).
+        let leaf_c = ImpactLeaf {
+            donor: donor_c.clone(),
+            donation_index: 2u32,
+            co2_kg: 300u32,
+            trees: 15u32,
+            hectares: 6u32,
+        };
+
+        // Use the proof for leaf_a (which is correct for leaf_a but NOT for leaf_c).
+        let proof = build_proof_for_leaf0(&env, &leaf_b);
+
+        // Donor C's impact should NOT verify with leaf_a's proof.
+        let result = client.verify_impact(&project_id, &report_id, &leaf_c, &proof, &0u32);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_merkle_proof_wrong_root() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, IndigoPayContract);
+        let client = IndigoPayContractClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&signers1(&env, &admin), &1u32);
+
+        let project_wallet = Address::generate(&env);
+        let project_id = String::from_str(&env, "forest-restore");
+        client.register_project(
+            &admin,
+            &project_id,
+            &String::from_str(&env, "Forest Restore"),
+            &project_wallet,
+            &100u32,
+        );
+
+        let donor_a = Address::generate(&env);
+        let donor_b = Address::generate(&env);
+
+        let leaf_a = ImpactLeaf {
+            donor: donor_a.clone(),
+            donation_index: 0u32,
+            co2_kg: 100u32,
+            trees: 5u32,
+            hectares: 2u32,
+        };
+        let leaf_b = ImpactLeaf {
+            donor: donor_b.clone(),
+            donation_index: 1u32,
+            co2_kg: 200u32,
+            trees: 10u32,
+            hectares: 4u32,
+        };
+
+        // Post a root for "Q1 2026" report.
+        let root = build_two_leaf_root(&env, &leaf_a, &leaf_b);
+        let report_id = String::from_str(&env, "Q1 2026");
+        client.set_impact_merkle_root(&admin, &project_id, &root, &report_id);
+
+        let proof = build_proof_for_leaf0(&env, &leaf_b);
+
+        // Verify against a different report_id that has NO root posted.
+        let wrong_report = String::from_str(&env, "Q2 2026");
+        let result = client.verify_impact(&project_id, &wrong_report, &leaf_a, &proof, &0u32);
+        assert!(!result);
+
+        // Verify against a wrong project_id.
+        let wrong_project = String::from_str(&env, "nonexistent");
+        let result = client.verify_impact(&wrong_project, &report_id, &leaf_a, &proof, &0u32);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_set_and_verify_impact_root() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, IndigoPayContract);
+        let client = IndigoPayContractClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&signers1(&env, &admin), &1u32);
+
+        let project_wallet = Address::generate(&env);
+        let project_id = String::from_str(&env, "ocean-cleanup");
+        client.register_project(
+            &admin,
+            &project_id,
+            &String::from_str(&env, "Ocean Cleanup"),
+            &project_wallet,
+            &50u32,
+        );
+
+        let donor = Address::generate(&env);
+
+        // Create a single-leaf Merkle tree (root = leaf hash).
+        let leaf = ImpactLeaf {
+            donor: donor.clone(),
+            donation_index: 0u32,
+            co2_kg: 500u32,
+            trees: 25u32,
+            hectares: 10u32,
+        };
+        let leaf_hash = compute_impact_leaf_hash(&env, &leaf);
+
+        let report_id = String::from_str(&env, "Annual 2026");
+
+        // Before posting, the root should not exist.
+        let stored = client.get_impact_merkle_root(&project_id, &report_id);
+        assert!(stored.is_none());
+
+        // Post the root (root = leaf hash for a single-leaf tree).
+        client.set_impact_merkle_root(&admin, &project_id, &leaf_hash, &report_id);
+
+        // After posting, the root should be retrievable.
+        let stored = client.get_impact_merkle_root(&project_id, &report_id);
+        assert_eq!(stored, Some(leaf_hash.clone()));
+
+        // Verify with empty proof (single leaf: root == leaf hash).
+        let empty_proof = Vec::new(&env);
+        let result = client.verify_impact(&project_id, &report_id, &leaf, &empty_proof, &0u32);
+        assert!(result);
+    }
+
+    #[test]
+    fn test_merkle_proof_wrong_leaf_index() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, IndigoPayContract);
+        let client = IndigoPayContractClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&signers1(&env, &admin), &1u32);
+
+        let project_wallet = Address::generate(&env);
+        let project_id = String::from_str(&env, "forest-restore");
+        client.register_project(
+            &admin,
+            &project_id,
+            &String::from_str(&env, "Forest Restore"),
+            &project_wallet,
+            &100u32,
+        );
+
+        let donor_a = Address::generate(&env);
+        let donor_b = Address::generate(&env);
+
+        let leaf_a = ImpactLeaf {
+            donor: donor_a.clone(),
+            donation_index: 0u32,
+            co2_kg: 100u32,
+            trees: 5u32,
+            hectares: 2u32,
+        };
+        let leaf_b = ImpactLeaf {
+            donor: donor_b.clone(),
+            donation_index: 1u32,
+            co2_kg: 200u32,
+            trees: 10u32,
+            hectares: 4u32,
+        };
+
+        let root = build_two_leaf_root(&env, &leaf_a, &leaf_b);
+        let proof = build_proof_for_leaf0(&env, &leaf_b);
+
+        let report_id = String::from_str(&env, "Q1 2026");
+        client.set_impact_merkle_root(&admin, &project_id, &root, &report_id);
+
+        // Leaf A is at index 0 with proof = [hash(leaf_b)].
+        // Claiming it's at index 1 reverses the sibling ordering:
+        //   idx=1 → sibling || hash instead of hash || sibling
+        // This produces a different combined value → verification fails.
+        let result = client.verify_impact(
+            &project_id,
+            &report_id,
+            &leaf_a,
+            &proof,
+            &1u32, // WRONG: leaf_a is actually at index 0
+        );
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_merkle_proof_mismatched_root() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, IndigoPayContract);
+        let client = IndigoPayContractClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&signers1(&env, &admin), &1u32);
+
+        let project_wallet = Address::generate(&env);
+        let project_id = String::from_str(&env, "forest-restore");
+        client.register_project(
+            &admin,
+            &project_id,
+            &String::from_str(&env, "Forest Restore"),
+            &project_wallet,
+            &100u32,
+        );
+
+        let donor_a = Address::generate(&env);
+        let donor_b = Address::generate(&env);
+        let donor_c = Address::generate(&env);
+
+        // Build a tree from leaf_a + leaf_b and post its root.
+        let leaf_a = ImpactLeaf {
+            donor: donor_a.clone(),
+            donation_index: 0u32,
+            co2_kg: 100u32,
+            trees: 5u32,
+            hectares: 2u32,
+        };
+        let leaf_b = ImpactLeaf {
+            donor: donor_b.clone(),
+            donation_index: 1u32,
+            co2_kg: 200u32,
+            trees: 10u32,
+            hectares: 4u32,
+        };
+        let root_ab = build_two_leaf_root(&env, &leaf_a, &leaf_b);
+
+        let report_id = String::from_str(&env, "Q1 2026");
+        client.set_impact_merkle_root(&admin, &project_id, &root_ab, &report_id);
+
+        // Build a DIFFERENT tree from leaf_a + leaf_c → different root.
+        let leaf_c = ImpactLeaf {
+            donor: donor_c.clone(),
+            donation_index: 2u32,
+            co2_kg: 300u32,
+            trees: 15u32,
+            hectares: 6u32,
+        };
+        let root_ac = build_two_leaf_root(&env, &leaf_a, &leaf_c);
+
+        // Verify that the two roots are actually different.
+        assert_ne!(root_ab, root_ac);
+
+        // Use leaf_a with proof for leaf_c against the STORED root_ab.
+        // The proof is valid for root_ac, but the stored root is root_ab.
+        let proof_for_ac = build_proof_for_leaf0(&env, &leaf_c);
+
+        let result = client.verify_impact(&project_id, &report_id, &leaf_a, &proof_for_ac, &0u32);
+        assert!(!result);
     }
 }
