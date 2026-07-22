@@ -190,6 +190,7 @@ export default function DonationFeed({
                 {d.anonymous || !d.donorAddress
                   ? "Anonymous"
                   : shortenAddress(d.donorAddress, 5)}
+                {d.donorAddress ? shortenAddress(d.donorAddress, 5) : "Anonymous"}
               </span>
               <span className="font-mono font-bold text-[#4F46E5] dark:text-[#818CF8] text-sm">
                 {d.currency === "USDC"

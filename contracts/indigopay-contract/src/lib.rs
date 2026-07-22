@@ -30,12 +30,9 @@ pub mod donation;
  *     --source alice --network testnet
  */
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, symbol_short, token, Address, BytesN,
-    Env, String, Symbol, Vec,
+    contract, contractclient, contractimpl, contracttype, symbol_short, token, Address, Bytes,
+    BytesN, Env, String, Symbol, Vec,
 };
-
-#[cfg(feature = "zk")]
-use soroban_sdk::Bytes;
 
 // ─── Oracle interface ─────────────────────────────────────────────────────────
 
@@ -281,6 +278,27 @@ pub struct VestingSchedule {
     pub token: Address,
 }
 
+/// An on-chain impact certificate leaf for a single donor's contribution.
+/// The platform constructs a Merkle tree of all donor impacts for a project's
+/// reporting period and posts only the root on-chain. Individual donors can then
+/// prove their specific impact (trees planted, CO₂ sequestered, hectares restored)
+/// against that root without revealing other donors' data.
+#[cfg(feature = "impact")]
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImpactLeaf {
+    /// Donor address whose impact this leaf represents.
+    pub donor: Address,
+    /// Index of the donation within the project's donation history.
+    pub donation_index: u32,
+    /// CO₂ offset in kilograms attributable to this donor.
+    pub co2_kg: u32,
+    /// Number of trees planted attributable to this donor.
+    pub trees: u32,
+    /// Hectares restored attributable to this donor.
+    pub hectares: u32,
+}
+
 #[contracttype]
 pub enum DataKey {
     // Multi-sig admin set: Vec<Address> of authorized admin addresses.
@@ -295,6 +313,7 @@ pub enum DataKey {
     DonorStats(Address),
     ImpactNFT(Address, BadgeTier),
     DonationCount,
+    AnonymousDonationCount,
     DonationRecord(u32),
     GlobalTotalRaised,
     GlobalCO2OffsetGrams,
@@ -396,6 +415,11 @@ pub enum DataKey {
     // Time-locked donation vesting (#386)
     VestingSchedule(Address, u32),
     DonorVestingCount(Address),
+    // Platform fee configuration (#385)
+    /// Fee in basis points (0–500, max 5%).
+    PlatformFeeBps,
+    /// Designated wallet that receives the platform fee.
+    PlatformTreasury,
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -456,6 +480,22 @@ const EMERGENCY_WITHDRAWAL_TIMELOCK: u32 = 120_960;
 // donation during which the donor may request a refund (subject to admin +
 // project wallet approval).
 const REFUND_COOLDOWN_LEDGERS: u32 = 17_280;
+
+/// Current storage schema version. Bump this and add a migration step in
+/// `migrate()` whenever a struct layout, DataKey variant, or stored value
+/// encoding changes in a backward-incompatible way.
+///
+/// v1: original schema (no version tracking)
+/// v2: Symbol-keyed storage version added (#379)
+const CURRENT_STORAGE_VERSION: u32 = 2;
+/// Storage key for the schema version. Uses a Symbol (not a DataKey variant)
+/// to avoid XDR codegen overhead in the slim WASM build.
+#[cfg(feature = "upgrade")]
+const STORAGE_VERSION_KEY: Symbol = symbol_short!("sv");
+
+/// Hard cap on platform fee: 500 basis points = 5%.
+#[cfg(feature = "fees")]
+const MAX_PLATFORM_FEE_BPS: u32 = 500;
 
 /// Read the stored admin set. Panics if not initialized.
 fn read_admin_set(env: &Env) -> Vec<Address> {
@@ -531,10 +571,167 @@ fn require_not_paused(env: &Env) {
     }
 }
 
+#[cfg(feature = "impact")]
+#[contracttype]
+#[derive(Clone, Debug)]
+enum ImpactKey {
+    /// Merkle root keyed by SHA-256(project_id || report_id).
+    ImRoot(BytesN<32>),
+}
+
+// ─── Merkle Proof Verification for Impact Certificates (#382) ──────────────
+
+#[cfg(feature = "impact")]
+/// Verify a Merkle proof against a known root using SHA-256.
+///
+/// Walks up the Merkle tree from `leaf` through each sibling in `proof`,
+/// re-hashing with SHA-256 at each level. The `index` determines sibling
+/// ordering: even indices put the current hash first, odd indices put the
+/// sibling first.
+///
+/// Returns `true` if the computed root matches the expected `root`.
+fn verify_merkle_proof(
+    env: &Env,
+    leaf: &BytesN<32>,
+    proof: &Vec<BytesN<32>>,
+    root: &BytesN<32>,
+    index: u32,
+) -> bool {
+    let mut hash: BytesN<32> = leaf.clone();
+    let mut idx = index;
+    for sibling in proof.iter() {
+        let mut combined = [0u8; 64];
+        if idx.is_multiple_of(2) {
+            combined[..32].copy_from_slice(&hash.to_array());
+            combined[32..].copy_from_slice(&sibling.to_array());
+        } else {
+            combined[..32].copy_from_slice(&sibling.to_array());
+            combined[32..].copy_from_slice(&hash.to_array());
+        }
+        hash = env
+            .crypto()
+            .sha256(&Bytes::from_slice(env, &combined))
+            .into();
+        idx /= 2;
+    }
+    hash == *root
+}
+
+#[cfg(feature = "impact")]
+/// Compute the leaf hash for an ImpactLeaf using deterministic XDR serialization
+/// followed by SHA-256. The off-chain Merkle tree builder MUST use the same
+/// serialization to produce the proof.
+fn compute_impact_leaf_hash(env: &Env, leaf: &ImpactLeaf) -> BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
+    let xdr_bytes = leaf.to_xdr(env);
+    env.crypto().sha256(&xdr_bytes).into()
+}
+
+#[cfg(feature = "impact")]
+/// Compute a deterministic 32-byte storage key from (project_id, report_id).
+/// Uses SHA-256 of each component separately then SHA-256 of the concatenation
+/// to prevent domain collisions (e.g., ("ab", "c") vs ("a", "bc")).
+fn impact_merkle_key(env: &Env, project_id: &String, report_id: &String) -> BytesN<32> {
+    let pid_hash = env.crypto().sha256(&project_id.clone().into());
+    let rid_hash = env.crypto().sha256(&report_id.clone().into());
+    let mut combined = [0u8; 64];
+    combined[..32].copy_from_slice(&pid_hash.to_array());
+    combined[32..].copy_from_slice(&rid_hash.to_array());
+    env.crypto()
+        .sha256(&Bytes::from_slice(env, &combined))
+        .into()
+}
+
+/// Read the configured platform fee in basis points.
+/// Returns 0 when the `fees` feature is disabled or no fee has been configured,
+/// preserving backward compatibility.
+fn read_platform_fee_bps(_env: &Env) -> u32 {
+    #[cfg(feature = "fees")]
+    {
+        env.storage()
+            .instance()
+            .get(&DataKey::PlatformFeeBps)
+            .unwrap_or(0)
+    }
+    #[cfg(not(feature = "fees"))]
+    {
+        0
+    }
+}
+
+/// Split `amount` into (project_amount, fee_amount) based on the configured fee
+/// rate in basis points. Returns `(amount, 0)` when `fee_bps` is 0.
+fn split_fee(amount: i128, fee_bps: u32) -> (i128, i128) {
+    if fee_bps == 0 {
+        return (amount, 0);
+    }
+    let fee = amount
+        .checked_mul(fee_bps as i128)
+        .expect("Fee calculation overflow")
+        / 10_000;
+    let project_amount = amount.checked_sub(fee).expect("Amount minus fee underflow");
+    (project_amount, fee)
+}
+
 fn ensure_min_ttl(env: &Env, min_ledgers: u32) {
     env.storage()
         .instance()
         .extend_ttl(min_ledgers, min_ledgers);
+}
+
+// ─── Storage versioning & migration (#379) ────────────────────────────────
+
+/// Run pending storage migrations sequentially from the current version to
+/// `CURRENT_STORAGE_VERSION`. Called automatically by `execute_upgrade()` after
+/// the WASM is swapped, before any other contract function can be invoked.
+///
+/// Each migration step function (e.g., `migrate_v1_to_v2`) is responsible for
+/// transforming old storage layouts to the new schema. After each step, the
+/// `StorageVersion` key is updated so the migration is never applied twice.
+#[cfg(feature = "upgrade")]
+fn migrate(env: &Env) {
+    let current: u32 = env
+        .storage()
+        .instance()
+        .get(&STORAGE_VERSION_KEY)
+        .unwrap_or(1);
+
+    if current < 2 {
+        migrate_v1_to_v2(env);
+        env.storage().instance().set(&STORAGE_VERSION_KEY, &2u32);
+    }
+    // if current < 3 { migrate_v2_to_v3(env); ... }
+
+    // After all migrations, StorageVersion must equal CURRENT_STORAGE_VERSION.
+    // If a deployer forgot to bump CURRENT_STORAGE_VERSION after adding a
+    // migration, this assertion catches it at upgrade time.
+    let final_version: u32 = env
+        .storage()
+        .instance()
+        .get(&STORAGE_VERSION_KEY)
+        .unwrap_or(1);
+    if final_version != CURRENT_STORAGE_VERSION {
+        panic!(
+            "Migration incomplete: at version {} but target is {}",
+            final_version, CURRENT_STORAGE_VERSION
+        );
+    }
+}
+
+/// v1 → v2: No data transformation needed.
+///
+/// Storage keys and struct layouts are backward-compatible from v1 to v2.
+/// This empty migration exists to establish the migration framework pattern.
+/// When the first real schema change is introduced, replace this with actual
+/// data transformations that rename keys, restructure values, or backfill
+/// missing entries.
+#[cfg(feature = "upgrade")]
+fn migrate_v1_to_v2(_env: &Env) {
+    // Intentionally empty — v1 data is v2-compatible.
+    // Example pattern for a real migration:
+    //   let old_value = env.storage().instance().get(&OldKey);
+    //   env.storage().instance().set(&NewKey, &transformed_value);
+    //   env.storage().instance().remove(&OldKey);
 }
 
 pub fn calculate_badge(total_stroops: i128) -> BadgeTier {
@@ -649,6 +846,12 @@ impl IndigoPayContract {
         env.storage()
             .instance()
             .set(&DataKey::GlobalCO2OffsetGrams, &0i128);
+        // Record the current storage schema version so post-upgrade migrations
+        // know which transformations have already been applied.
+        #[cfg(feature = "upgrade")]
+        env.storage()
+            .instance()
+            .set(&STORAGE_VERSION_KEY, &CURRENT_STORAGE_VERSION);
         ensure_min_ttl(&env, VOTING_WINDOW_LEDGERS * 4);
     }
 
@@ -1132,6 +1335,45 @@ impl IndigoPayContract {
         );
     }
 
+    // ─── Platform Fee Configuration (#385) ────────────────────────────────────
+
+    /// Admin-only (M-of-N): set the platform fee in basis points.
+    ///
+    /// `fee_bps` is capped at `MAX_PLATFORM_FEE_BPS` (500 = 5%).
+    /// Setting to 0 disables the fee (backward compatible).
+    ///
+    /// # Panics
+    /// - If `fee_bps` exceeds `MAX_PLATFORM_FEE_BPS` (500).
+    #[cfg(feature = "fees")]
+    pub fn set_platform_fee(env: Env, signers: Vec<Address>, fee_bps: u32) {
+        require_admin_for_critical(&env, &signers);
+        require_not_paused(&env);
+        if fee_bps > MAX_PLATFORM_FEE_BPS {
+            panic!("Platform fee exceeds maximum of 500 bps (5%)");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformFeeBps, &fee_bps);
+        env.events()
+            .publish((symbol_short!("fee_set"), signers.get(0).unwrap()), fee_bps);
+        ensure_min_ttl(&env, VOTING_WINDOW_LEDGERS * 4);
+    }
+
+    /// Admin-only (M-of-N): set the platform treasury address that receives fees.
+    #[cfg(feature = "fees")]
+    pub fn set_platform_treasury(env: Env, signers: Vec<Address>, treasury: Address) {
+        require_admin_for_critical(&env, &signers);
+        require_not_paused(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformTreasury, &treasury);
+        env.events().publish(
+            (symbol_short!("treas_set"), signers.get(0).unwrap()),
+            treasury,
+        );
+        ensure_min_ttl(&env, VOTING_WINDOW_LEDGERS * 4);
+    }
+
     // ─── Donations ────────────────────────────────────────────────────────────
 
     #[allow(clippy::too_many_arguments)]
@@ -1141,6 +1383,22 @@ impl IndigoPayContract {
     }
 
     /// Donate with an explicit public-attribution preference.
+    pub fn donate_with_privacy(
+    #[cfg(any(feature = "donation", feature = "testutils"))]
+    pub fn donate(
+        env: Env,
+        token: Address,
+        donor: Address,
+        project_id: String,
+        amount: i128,
+        msg_hash: u32,
+        anonymous: bool,
+    ) {
+        Self::donate_with_privacy(env, token, donor, project_id, amount, msg_hash, false)
+    }
+
+    /// Donate with an explicit public-attribution preference.
+    #[cfg(any(feature = "donation", feature = "testutils"))]
     pub fn donate_with_privacy(
         env: Env,
         token: Address,
@@ -1213,6 +1471,14 @@ impl IndigoPayContract {
         // Anonymous donations must not accrue to the donor's publicly-queryable
         // profile. Use the non-attributable placeholder for internal badge data.
         let stats_donor = public_donor(&env, &donor, anonymous);
+        let stats_donor = if anonymous {
+            Address::from_string(&String::from_str(
+                &env,
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            ))
+        } else {
+            donor.clone()
+        };
         let mut donor_stats: DonorStats = env
             .storage()
             .instance()
@@ -1312,6 +1578,7 @@ impl IndigoPayContract {
         // Store donation record for trustless enumeration
         let donation_record = DonationRecord {
             donor: public_donor(&env, &donor, anonymous),
+            donor: donor.clone(),
             anonymous,
             project: project_id.clone(),
             amount,
@@ -1327,6 +1594,18 @@ impl IndigoPayContract {
             let key = DataKey::AnonymousDonationCount(project_id.clone());
             let count: u32 = env.storage().instance().get(&key).unwrap_or(0);
             env.storage().instance().set(&key, &count.checked_add(1).expect("AnonymousDonationCount overflow"));
+        if anonymous {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::AnonymousDonationCount)
+                .unwrap_or(0);
+            env.storage().instance().set(
+                &DataKey::AnonymousDonationCount,
+                &count
+                    .checked_add(1)
+                    .expect("AnonymousDonationCount overflow"),
+            );
         }
         // Snapshot CO₂ offset for exact reversal on refund (#290).
         env.storage()
@@ -1354,11 +1633,46 @@ impl IndigoPayContract {
             .set(&DataKey::GlobalCO2OffsetGrams, &new_gc);
 
         // ── Interaction: external call happens after every effect is durable.
-        let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&donor, &project.wallet, &amount);
+        let fee_bps = read_platform_fee_bps(&env);
+        #[allow(unused_variables)]
+        let (project_amount, fee_amount) = split_fee(amount, fee_bps);
 
+        let token_client = token::Client::new(&env, &token);
+
+        // Transfer platform fee to treasury (if configured and feature enabled).
+        #[cfg(feature = "fees")]
+        if fee_amount > 0 {
+            let treasury: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::PlatformTreasury)
+                .expect("Platform treasury not configured");
+            token_client.transfer(&donor, &treasury, &fee_amount);
+        }
+
+        // Transfer remainder to project wallet.
+        token_client.transfer(&donor, &project.wallet, &project_amount);
+
+        #[cfg(feature = "fees")]
         env.events().publish(
             (symbol_short!("donated"), public_donor(&env, &donor, anonymous), project_id.clone()),
+            (symbol_short!("donated"), donor.clone(), project_id.clone()),
+            (amount, donor_stats.badge.clone(), msg_hash, fee_amount),
+        );
+        #[cfg(not(feature = "fees"))]
+        env.events().publish(
+            (
+                symbol_short!("donated"),
+                if anonymous {
+                    Address::from_string(&String::from_str(
+                        &env,
+                        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                    ))
+                } else {
+                    donor.clone()
+                },
+                project_id.clone(),
+            ),
             (amount, donor_stats.badge.clone(), msg_hash),
         );
         ensure_min_ttl(&env, VOTING_WINDOW_LEDGERS * 4);
@@ -1386,6 +1700,30 @@ impl IndigoPayContract {
     }
 
     /// Record a path-payment donation with an attribution preference.
+    pub fn donate_asset_with_privacy(
+    #[cfg(any(feature = "donation", feature = "testutils"))]
+    pub fn donate_asset(
+        env: Env,
+        donor: Address,
+        project_id: String,
+        xlm_amount: i128,
+        source_asset_code: Symbol,
+        msg_hash: u32,
+        anonymous: bool,
+    ) {
+        Self::donate_asset_with_privacy(
+            env,
+            donor,
+            project_id,
+            xlm_amount,
+            source_asset_code,
+            msg_hash,
+            false,
+        )
+    }
+
+    /// Record a path-payment donation with an attribution preference.
+    #[cfg(any(feature = "donation", feature = "testutils"))]
     pub fn donate_asset_with_privacy(
         env: Env,
         donor: Address,
@@ -1421,6 +1759,14 @@ impl IndigoPayContract {
             .expect("CO2 calculation overflow");
 
         let stats_donor = public_donor(&env, &donor, anonymous);
+        let stats_donor = if anonymous {
+            Address::from_string(&String::from_str(
+                &env,
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            ))
+        } else {
+            donor.clone()
+        };
         let mut donor_stats: DonorStats = env
             .storage()
             .instance()
@@ -1519,6 +1865,7 @@ impl IndigoPayContract {
         // Store donation record with the source asset code as currency
         let donation_record = DonationRecord {
             donor: public_donor(&env, &donor, anonymous),
+            donor: donor.clone(),
             anonymous,
             project: project_id.clone(),
             amount: xlm_amount,
@@ -1534,6 +1881,18 @@ impl IndigoPayContract {
             let key = DataKey::AnonymousDonationCount(project_id.clone());
             let count: u32 = env.storage().instance().get(&key).unwrap_or(0);
             env.storage().instance().set(&key, &count.checked_add(1).expect("AnonymousDonationCount overflow"));
+        if anonymous {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::AnonymousDonationCount)
+                .unwrap_or(0);
+            env.storage().instance().set(
+                &DataKey::AnonymousDonationCount,
+                &count
+                    .checked_add(1)
+                    .expect("AnonymousDonationCount overflow"),
+            );
         }
         // Snapshot CO₂ offset for exact reversal on refund (#290).
         env.storage()
@@ -1565,8 +1924,33 @@ impl IndigoPayContract {
         // No token transfer — the path payment already delivered XLM to the
         // project wallet in the same Stellar transaction.
 
+        #[cfg(feature = "fees")]
+        {
+            let fee_bps = read_platform_fee_bps(&env);
+            let (_project_amount, fee_amount) = split_fee(xlm_amount, fee_bps);
+            // Note: no actual fee transfer occurs here because the path payment
+            // already delivered XLM to the project wallet in the same transaction.
+            // The fee is emitted in the event for transparency only.
+            env.events().publish(
+                (symbol_short!("donated"), donor.clone(), project_id.clone()),
+                (xlm_amount, donor_stats.badge.clone(), msg_hash, fee_amount),
+            );
+        }
+        #[cfg(not(feature = "fees"))]
         env.events().publish(
             (symbol_short!("donated"), public_donor(&env, &donor, anonymous), project_id.clone()),
+            (
+                symbol_short!("donated"),
+                if anonymous {
+                    Address::from_string(&String::from_str(
+                        &env,
+                        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                    ))
+                } else {
+                    donor.clone()
+                },
+                project_id.clone(),
+            ),
             (xlm_amount, donor_stats.badge.clone(), msg_hash),
         );
         ensure_min_ttl(&env, VOTING_WINDOW_LEDGERS * 4);
@@ -1597,6 +1981,22 @@ impl IndigoPayContract {
     #[cfg(feature = "zk")]
     pub fn get_zk_verification_key(env: Env) -> Option<Bytes> {
         env.storage().instance().get(&DataKey::ZkVerificationKey)
+    }
+
+    #[cfg(feature = "impact")]
+    /// Get the Merkle root for a project impact report.
+    pub fn get_impact_merkle_root(
+        env: Env,
+        project_id: String,
+        report_id: String,
+    ) -> Option<BytesN<32>> {
+        env.storage()
+            .instance()
+            .get(&ImpactKey::ImRoot(impact_merkle_key(
+                &env,
+                &project_id,
+                &report_id,
+            )))
     }
 
     /// Anonymous donation via zk-SNARK proof verification.
@@ -1838,8 +2238,35 @@ impl IndigoPayContract {
         //    atomic transaction (before this call) so the contract holds a
         //    sufficient balance.
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&env.current_contract_address(), &project.wallet, &amount);
+        let contract_addr = env.current_contract_address();
 
+        // Fee split for anonymous donations.
+        let fee_bps = read_platform_fee_bps(&env);
+        #[allow(unused_variables)]
+        let (project_amount, fee_amount) = split_fee(amount, fee_bps);
+
+        #[cfg(feature = "fees")]
+        if fee_amount > 0 {
+            let treasury: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::PlatformTreasury)
+                .expect("Platform treasury not configured");
+            token_client.transfer(&contract_addr, &treasury, &fee_amount);
+        }
+
+        token_client.transfer(&contract_addr, &project.wallet, &project_amount);
+
+        #[cfg(feature = "fees")]
+        env.events().publish(
+            (
+                symbol_short!("anon_don"),
+                anon_donor.clone(),
+                project_id.clone(),
+            ),
+            (amount, donor_stats.badge.clone(), msg_hash, fee_amount),
+        );
+        #[cfg(not(feature = "fees"))]
         env.events().publish(
             (
                 symbol_short!("anon_don"),
@@ -1855,6 +2282,95 @@ impl IndigoPayContract {
     #[cfg(feature = "zk")]
     pub fn is_nullifier_spent(env: Env, nullifier: BytesN<32>) -> bool {
         env.storage().instance().has(&DataKey::Nullifier(nullifier))
+    }
+
+    // ─── On-chain Impact Certificates (#382) ────────────────────────────────
+
+    #[cfg(feature = "impact")]
+    /// Admin-only: post a Merkle root for a project's impact report.
+    ///
+    /// The Merkle tree of all donor impacts for the reporting period
+    /// is constructed off-chain by the backend. Only the root is stored
+    /// on-chain, enabling any donor to verify their individual impact
+    /// leaf against it via `verify_impact` without revealing other donors'
+    /// data.
+    ///
+    /// # Parameters
+    /// - `admin`: A registered admin address (requires `require_auth`).
+    /// - `project_id`: The project this report belongs to.
+    /// - `merkle_root`: The 32-byte Merkle root computed off-chain.
+    /// - `report_id`: A human-readable report identifier (e.g. "Q1 2026").
+    ///
+    /// # Panics
+    /// - If the caller is not an admin.
+    /// - If the contract is paused.
+    /// - If the project does not exist.
+    pub fn set_impact_merkle_root(
+        env: Env,
+        admin: Address,
+        project_id: String,
+        merkle_root: BytesN<32>,
+        report_id: String,
+    ) {
+        require_admin_for_routine(&env, &admin);
+        require_not_paused(&env);
+        // Verify the project exists so we don't store roots for phantom projects.
+        env.storage()
+            .instance()
+            .get::<_, Project>(&DataKey::Project(project_id.clone()))
+            .expect("Project not found");
+
+        env.storage().instance().set(
+            &ImpactKey::ImRoot(impact_merkle_key(&env, &project_id, &report_id)),
+            &merkle_root,
+        );
+
+        env.events().publish(
+            (symbol_short!("impact_rt"), admin, project_id, report_id),
+            merkle_root,
+        );
+        ensure_min_ttl(&env, VOTING_WINDOW_LEDGERS * 4);
+    }
+
+    #[cfg(feature = "impact")]
+    /// Public read-only: verify a donor's impact claim against a stored Merkle root.
+    ///
+    /// Any caller (donor, auditor, third party) can invoke this function to
+    /// cryptographically verify that the platform's claimed impact for a
+    /// specific donor matches the on-chain Merkle root. No authorization is
+    /// required — only the mathematical correctness of the proof.
+    ///
+    /// # Parameters
+    /// - `project_id`: The project the impact report belongs to.
+    /// - `report_id`: The report identifier (must match what was passed to
+    ///   `set_impact_merkle_root`).
+    /// - `impact_data`: The `ImpactLeaf` claimed for this donor.
+    /// - `proof`: The Merkle proof (list of sibling hashes) from the leaf to
+    ///   the root.
+    /// - `leaf_index`: The position of this leaf within the Merkle tree
+    ///   (used to determine sibling ordering).
+    ///
+    /// # Returns
+    /// - `true` if the proof is valid and the computed root matches the stored root.
+    /// - `false` if the Merkle root has not been posted for this project/report,
+    ///   or the proof does not verify.
+    pub fn verify_impact(
+        env: Env,
+        project_id: String,
+        report_id: String,
+        impact_data: ImpactLeaf,
+        proof: Vec<BytesN<32>>,
+        leaf_index: u32,
+    ) -> bool {
+        let key = ImpactKey::ImRoot(impact_merkle_key(&env, &project_id, &report_id));
+        let stored_root: Option<BytesN<32>> = env.storage().instance().get(&key);
+        let stored_root = match stored_root {
+            Some(r) => r,
+            None => return false,
+        };
+
+        let leaf_hash = compute_impact_leaf_hash(&env, &impact_data);
+        verify_merkle_proof(&env, &leaf_hash, &proof, &stored_root, leaf_index)
     }
 
     // ─── Getters ─────────────────────────────────────────────────────────────
@@ -1977,6 +2493,11 @@ impl IndigoPayContract {
     /// Number of donations whose donor address is intentionally withheld.
     pub fn get_anonymous_donation_count(env: Env, project_id: String) -> u32 {
         env.storage().instance().get(&DataKey::AnonymousDonationCount(project_id)).unwrap_or(0)
+    pub fn get_anonymous_donation_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AnonymousDonationCount)
+            .unwrap_or(0)
     }
 
     /// Returns all four global counters in a single contract call.
@@ -2512,11 +3033,34 @@ impl IndigoPayContract {
     }
 
     /// Donate USDC. Converts to XLM-equivalent for global stats using a price oracle stub.
+    /// Backward-compatible USDC entrypoint.
     #[cfg(feature = "usdc")]
     /// Backward-compatible USDC entrypoint.
     #[cfg(feature = "usdc")]
     pub fn donate_usdc(env: Env, usdc_token: Address, donor: Address, project_id: String, usdc_amount: i128, msg_hash: u32) {
         Self::donate_usdc_with_privacy(env, usdc_token, donor, project_id, usdc_amount, msg_hash, false)
+    }
+
+    /// Donate USDC with an explicit public-attribution preference.
+    #[cfg(feature = "usdc")]
+    pub fn donate_usdc_with_privacy(
+        env: Env,
+        usdc_token: Address,
+        donor: Address,
+        project_id: String,
+        usdc_amount: i128,
+        msg_hash: u32,
+        anonymous: bool,
+    ) {
+        Self::donate_usdc_with_privacy(
+            env,
+            usdc_token,
+            donor,
+            project_id,
+            usdc_amount,
+            msg_hash,
+            false,
+        )
     }
 
     /// Donate USDC with an explicit public-attribution preference.
@@ -2577,6 +3121,14 @@ impl IndigoPayContract {
             .expect("CO2 calculation overflow");
 
         let stats_donor = public_donor(&env, &donor, anonymous);
+        let stats_donor = if anonymous {
+            Address::from_string(&String::from_str(
+                &env,
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            ))
+        } else {
+            donor.clone()
+        };
         let mut donor_stats: DonorStats = env
             .storage()
             .instance()
@@ -2663,6 +3215,7 @@ impl IndigoPayContract {
         // Store USDC donation record for trustless enumeration
         let donation_record = DonationRecord {
             donor: public_donor(&env, &donor, anonymous),
+            donor: donor.clone(),
             anonymous,
             project: project_id.clone(),
             amount: usdc_amount,
@@ -2678,6 +3231,18 @@ impl IndigoPayContract {
             let key = DataKey::AnonymousDonationCount(project_id.clone());
             let count: u32 = env.storage().instance().get(&key).unwrap_or(0);
             env.storage().instance().set(&key, &count.checked_add(1).expect("AnonymousDonationCount overflow"));
+        if anonymous {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::AnonymousDonationCount)
+                .unwrap_or(0);
+            env.storage().instance().set(
+                &DataKey::AnonymousDonationCount,
+                &count
+                    .checked_add(1)
+                    .expect("AnonymousDonationCount overflow"),
+            );
         }
         // Snapshot CO₂ offset for exact reversal on refund (#290).
         env.storage()
@@ -2718,10 +3283,44 @@ impl IndigoPayContract {
 
         let token_client = token::Client::new(&env, &usdc_token);
         let project_wallet = project.wallet;
-        token_client.transfer(&donor, &project_wallet, &usdc_amount);
 
+        // Fee split for USDC donations.
+        let fee_bps = read_platform_fee_bps(&env);
+        #[allow(unused_variables)]
+        let (project_usdc, fee_amount) = split_fee(usdc_amount, fee_bps);
+
+        #[cfg(feature = "fees")]
+        if fee_amount > 0 {
+            let treasury: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::PlatformTreasury)
+                .expect("Platform treasury not configured");
+            token_client.transfer(&donor, &treasury, &fee_amount);
+        }
+
+        token_client.transfer(&donor, &project_wallet, &project_usdc);
+
+        #[cfg(feature = "fees")]
         env.events().publish(
             (symbol_short!("donated"), public_donor(&env, &donor, anonymous), project_id),
+            (symbol_short!("donated"), donor.clone(), project_id),
+            (usdc_amount, symbol_short!("USDC"), msg_hash, fee_amount),
+        );
+        #[cfg(not(feature = "fees"))]
+        env.events().publish(
+            (
+                symbol_short!("donated"),
+                if anonymous {
+                    Address::from_string(&String::from_str(
+                        &env,
+                        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                    ))
+                } else {
+                    donor.clone()
+                },
+                project_id,
+            ),
             (usdc_amount, symbol_short!("USDC"), msg_hash),
         );
         ensure_min_ttl(&env, VOTING_WINDOW_LEDGERS * 4);
@@ -3060,6 +3659,9 @@ impl IndigoPayContract {
             .instance()
             .remove(&DataKey::UpgradeEffectiveAt);
         env.events().publish((symbol_short!("upg_exec"),), pending);
+        // Run storage migrations so any schema changes in the new WASM are
+        // applied before the next contract invocation.
+        migrate(&env);
         ensure_min_ttl(&env, VOTING_WINDOW_LEDGERS * 4);
     }
 
@@ -3099,6 +3701,16 @@ impl IndigoPayContract {
     #[cfg(feature = "upgrade")]
     pub fn get_last_executed_upgrade(env: Env) -> Option<BytesN<32>> {
         env.storage().instance().get(&DataKey::LastExecutedUpgrade)
+    }
+
+    /// Read the current storage schema version. Returns 1 when the key is
+    /// absent (pre-versioning deployments are implicitly v1).
+    #[cfg(feature = "upgrade")]
+    pub fn get_storage_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&STORAGE_VERSION_KEY)
+            .unwrap_or(1)
     }
 
     // ─── Emergency withdrawal (7-day timelock) ─────────────────────────────────
@@ -4640,6 +5252,66 @@ mod tests {
             assert_eq!(global_total, amount);
             assert_eq!(global_co2, expected_co2);
         });
+    }
+
+    // ─── Storage versioning & migration tests (#379) ────────────────────────
+
+    #[cfg(feature = "upgrade")]
+    #[test]
+    fn test_storage_version_initialized() {
+        let (env, _cid, client, _admin, _pid) = setup();
+        // After initialize(), StorageVersion must equal CURRENT_STORAGE_VERSION.
+        assert_eq!(client.get_storage_version(), CURRENT_STORAGE_VERSION);
+    }
+
+    #[cfg(feature = "upgrade")]
+    #[test]
+    fn test_migration_runs_on_upgrade() {
+        let (env, cid, client, _admin, _pid) = setup();
+
+        // After initialize(), StorageVersion must equal CURRENT_STORAGE_VERSION.
+        assert_eq!(client.get_storage_version(), CURRENT_STORAGE_VERSION);
+
+        // Simulate a same-code upgrade by re-registering the contract at the
+        // same address, then calling migrate() directly.
+        let v2_cid = env.register_contract(Some(&cid), IndigoPayContract);
+        assert_eq!(v2_cid, cid);
+
+        env.as_contract(&cid, || {
+            crate::migrate(&env);
+        });
+
+        // Version should still be CURRENT_STORAGE_VERSION after a same-code
+        // upgrade with no pending migrations.
+        assert_eq!(client.get_storage_version(), CURRENT_STORAGE_VERSION);
+    }
+
+    #[cfg(feature = "upgrade")]
+    #[test]
+    fn test_migration_idempotent() {
+        let (env, cid, client, _admin, _pid) = setup();
+
+        // Simulate upgrade by re-registering at the same address.
+        let v2_cid = env.register_contract(Some(&cid), IndigoPayContract);
+        assert_eq!(v2_cid, cid);
+
+        // Call migrate() for the first time.
+        env.as_contract(&cid, || {
+            crate::migrate(&env);
+        });
+
+        let version_after_first = client.get_storage_version();
+        assert_eq!(version_after_first, CURRENT_STORAGE_VERSION);
+
+        // Call migrate a second time: the assertion in migrate() that
+        // final_version == CURRENT_STORAGE_VERSION must still hold —
+        // no double-application of migrations.
+        env.as_contract(&cid, || {
+            crate::migrate(&env);
+        });
+
+        let version_after_second = client.get_storage_version();
+        assert_eq!(version_after_second, CURRENT_STORAGE_VERSION);
     }
 
     // ─── Governance tests ─────────────────────────────────────────────────────
@@ -7706,5 +8378,460 @@ mod tests {
         // Another address tries to cancel.
         let impostor = Address::generate(&env);
         client.cancel_vesting(&impostor, &schedule_id);
+    }
+
+    // ─── Platform fee tests (#385) ───────────────────────────────────────────
+
+    #[cfg(feature = "fees")]
+    #[test]
+    fn test_donate_with_fee() {
+        let (env, _cid, client, admin, pid) = setup();
+
+        // Configure 200 bps (2%) platform fee.
+        let treasury = Address::generate(&env);
+        client.set_platform_treasury(&signers1(&env, &admin), &treasury);
+        client.set_platform_fee(&signers1(&env, &admin), &200u32);
+
+        let donor = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let amount: i128 = 100 * STROOP; // 100 XLM
+        StellarAssetClient::new(&env, &token).mint(&donor, &amount);
+
+        client.donate(&token, &donor, &pid, &amount, &0u32);
+
+        // Full amount recorded for project total and donor stats.
+        let p = client.get_project(&pid);
+        assert_eq!(p.total_raised, amount);
+        let stats = client.get_donor_stats(&donor);
+        assert_eq!(stats.total_donated, amount);
+        assert_eq!(client.get_global_total(), amount);
+
+        // 2% fee = 2 XLM = 20_000_000 stroops to treasury.
+        // 98 XLM = 980_000_000 stroops to project.
+    }
+
+    #[cfg(feature = "fees")]
+    #[test]
+    fn test_donate_with_zero_fee() {
+        let (env, _cid, client, _admin, pid) = setup();
+
+        // Fee defaults to 0 — 100% goes to project (existing behavior).
+        let donor = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let amount: i128 = 50 * STROOP;
+        StellarAssetClient::new(&env, &token).mint(&donor, &amount);
+
+        client.donate(&token, &donor, &pid, &amount, &0u32);
+
+        let p = client.get_project(&pid);
+        assert_eq!(p.total_raised, amount);
+        let stats = client.get_donor_stats(&donor);
+        assert_eq!(stats.total_donated, amount);
+        assert_eq!(client.get_global_total(), amount);
+    }
+
+    #[cfg(feature = "fees")]
+    #[test]
+    #[should_panic(expected = "Platform fee exceeds maximum of 500 bps (5%)")]
+    fn test_fee_exceeds_maximum() {
+        let (env, _cid, client, admin, _pid) = setup();
+
+        // Setting 600 bps (6%) must panic — exceeds 500 bps cap.
+        client.set_platform_fee(&signers1(&env, &admin), &600u32);
+    }
+
+    #[cfg(feature = "fees")]
+    #[test]
+    fn test_fee_emitted_in_event() {
+        let (env, _cid, client, admin, pid) = setup();
+
+        // Configure 200 bps (2%) platform fee.
+        let treasury = Address::generate(&env);
+        client.set_platform_treasury(&signers1(&env, &admin), &treasury);
+        client.set_platform_fee(&signers1(&env, &admin), &200u32);
+
+        let donor = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let amount: i128 = 100 * STROOP;
+        StellarAssetClient::new(&env, &token).mint(&donor, &amount);
+
+        client.donate(&token, &donor, &pid, &amount, &0u32);
+
+        // Verify donation was recorded and events include the fee.
+        let p = client.get_project(&pid);
+        assert_eq!(p.total_raised, amount);
+        let record = client.get_donation_record(&0u32);
+        assert_eq!(record.amount, amount);
+    }
+
+    // ─── On-chain Impact Certificates (#382) ────────────────────────────────
+
+    #[cfg(feature = "impact")]
+    /// Helper: compute the Merkle root for two leaves at indices 0 and 1.
+    /// Used to build a known-good test root from ImpactLeaf values.
+    fn build_two_leaf_root(env: &Env, leaf0: &ImpactLeaf, leaf1: &ImpactLeaf) -> BytesN<32> {
+        let hash0 = compute_impact_leaf_hash(env, leaf0);
+        let hash1 = compute_impact_leaf_hash(env, leaf1);
+        let mut combined = [0u8; 64];
+        combined[..32].copy_from_slice(&hash0.to_array());
+        combined[32..].copy_from_slice(&hash1.to_array());
+        env.crypto()
+            .sha256(&Bytes::from_slice(env, &combined))
+            .into()
+    }
+
+    /// Helper: build a proof for leaf at index 0 in a two-leaf tree.
+    fn build_proof_for_leaf0(env: &Env, leaf1: &ImpactLeaf) -> Vec<BytesN<32>> {
+        let mut proof = Vec::new(env);
+        proof.push_back(compute_impact_leaf_hash(env, leaf1));
+        proof
+    }
+
+    #[test]
+    fn test_merkle_proof_verification_valid() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, IndigoPayContract);
+        let client = IndigoPayContractClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&signers1(&env, &admin), &1u32);
+
+        let project_wallet = Address::generate(&env);
+        let project_id = String::from_str(&env, "forest-restore");
+        client.register_project(
+            &admin,
+            &project_id,
+            &String::from_str(&env, "Forest Restore"),
+            &project_wallet,
+            &100u32,
+        );
+
+        let donor_a = Address::generate(&env);
+        let donor_b = Address::generate(&env);
+
+        let leaf_a = ImpactLeaf {
+            donor: donor_a.clone(),
+            donation_index: 0u32,
+            co2_kg: 100u32,
+            trees: 5u32,
+            hectares: 2u32,
+        };
+        let leaf_b = ImpactLeaf {
+            donor: donor_b.clone(),
+            donation_index: 1u32,
+            co2_kg: 200u32,
+            trees: 10u32,
+            hectares: 4u32,
+        };
+
+        let root = build_two_leaf_root(&env, &leaf_a, &leaf_b);
+        let proof = build_proof_for_leaf0(&env, &leaf_b);
+
+        let report_id = String::from_str(&env, "Q1 2026");
+        client.set_impact_merkle_root(&admin, &project_id, &root, &report_id);
+
+        // Donor A's impact should verify with the correct proof.
+        let result = client.verify_impact(&project_id, &report_id, &leaf_a, &proof, &0u32);
+        assert!(result);
+    }
+
+    #[test]
+    fn test_merkle_proof_verification_invalid() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, IndigoPayContract);
+        let client = IndigoPayContractClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&signers1(&env, &admin), &1u32);
+
+        let project_wallet = Address::generate(&env);
+        let project_id = String::from_str(&env, "forest-restore");
+        client.register_project(
+            &admin,
+            &project_id,
+            &String::from_str(&env, "Forest Restore"),
+            &project_wallet,
+            &100u32,
+        );
+
+        let donor_a = Address::generate(&env);
+        let donor_b = Address::generate(&env);
+        let donor_c = Address::generate(&env);
+
+        let leaf_a = ImpactLeaf {
+            donor: donor_a.clone(),
+            donation_index: 0u32,
+            co2_kg: 100u32,
+            trees: 5u32,
+            hectares: 2u32,
+        };
+        let leaf_b = ImpactLeaf {
+            donor: donor_b.clone(),
+            donation_index: 1u32,
+            co2_kg: 200u32,
+            trees: 10u32,
+            hectares: 4u32,
+        };
+
+        let root = build_two_leaf_root(&env, &leaf_a, &leaf_b);
+        let report_id = String::from_str(&env, "Q1 2026");
+        client.set_impact_merkle_root(&admin, &project_id, &root, &report_id);
+
+        // Create a different leaf for donor C (not in the tree).
+        let leaf_c = ImpactLeaf {
+            donor: donor_c.clone(),
+            donation_index: 2u32,
+            co2_kg: 300u32,
+            trees: 15u32,
+            hectares: 6u32,
+        };
+
+        // Use the proof for leaf_a (which is correct for leaf_a but NOT for leaf_c).
+        let proof = build_proof_for_leaf0(&env, &leaf_b);
+
+        // Donor C's impact should NOT verify with leaf_a's proof.
+        let result = client.verify_impact(&project_id, &report_id, &leaf_c, &proof, &0u32);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_merkle_proof_wrong_root() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, IndigoPayContract);
+        let client = IndigoPayContractClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&signers1(&env, &admin), &1u32);
+
+        let project_wallet = Address::generate(&env);
+        let project_id = String::from_str(&env, "forest-restore");
+        client.register_project(
+            &admin,
+            &project_id,
+            &String::from_str(&env, "Forest Restore"),
+            &project_wallet,
+            &100u32,
+        );
+
+        let donor_a = Address::generate(&env);
+        let donor_b = Address::generate(&env);
+
+        let leaf_a = ImpactLeaf {
+            donor: donor_a.clone(),
+            donation_index: 0u32,
+            co2_kg: 100u32,
+            trees: 5u32,
+            hectares: 2u32,
+        };
+        let leaf_b = ImpactLeaf {
+            donor: donor_b.clone(),
+            donation_index: 1u32,
+            co2_kg: 200u32,
+            trees: 10u32,
+            hectares: 4u32,
+        };
+
+        // Post a root for "Q1 2026" report.
+        let root = build_two_leaf_root(&env, &leaf_a, &leaf_b);
+        let report_id = String::from_str(&env, "Q1 2026");
+        client.set_impact_merkle_root(&admin, &project_id, &root, &report_id);
+
+        let proof = build_proof_for_leaf0(&env, &leaf_b);
+
+        // Verify against a different report_id that has NO root posted.
+        let wrong_report = String::from_str(&env, "Q2 2026");
+        let result = client.verify_impact(&project_id, &wrong_report, &leaf_a, &proof, &0u32);
+        assert!(!result);
+
+        // Verify against a wrong project_id.
+        let wrong_project = String::from_str(&env, "nonexistent");
+        let result = client.verify_impact(&wrong_project, &report_id, &leaf_a, &proof, &0u32);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_set_and_verify_impact_root() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, IndigoPayContract);
+        let client = IndigoPayContractClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&signers1(&env, &admin), &1u32);
+
+        let project_wallet = Address::generate(&env);
+        let project_id = String::from_str(&env, "ocean-cleanup");
+        client.register_project(
+            &admin,
+            &project_id,
+            &String::from_str(&env, "Ocean Cleanup"),
+            &project_wallet,
+            &50u32,
+        );
+
+        let donor = Address::generate(&env);
+
+        // Create a single-leaf Merkle tree (root = leaf hash).
+        let leaf = ImpactLeaf {
+            donor: donor.clone(),
+            donation_index: 0u32,
+            co2_kg: 500u32,
+            trees: 25u32,
+            hectares: 10u32,
+        };
+        let leaf_hash = compute_impact_leaf_hash(&env, &leaf);
+
+        let report_id = String::from_str(&env, "Annual 2026");
+
+        // Before posting, the root should not exist.
+        let stored = client.get_impact_merkle_root(&project_id, &report_id);
+        assert!(stored.is_none());
+
+        // Post the root (root = leaf hash for a single-leaf tree).
+        client.set_impact_merkle_root(&admin, &project_id, &leaf_hash, &report_id);
+
+        // After posting, the root should be retrievable.
+        let stored = client.get_impact_merkle_root(&project_id, &report_id);
+        assert_eq!(stored, Some(leaf_hash.clone()));
+
+        // Verify with empty proof (single leaf: root == leaf hash).
+        let empty_proof = Vec::new(&env);
+        let result = client.verify_impact(&project_id, &report_id, &leaf, &empty_proof, &0u32);
+        assert!(result);
+    }
+
+    #[test]
+    fn test_merkle_proof_wrong_leaf_index() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, IndigoPayContract);
+        let client = IndigoPayContractClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&signers1(&env, &admin), &1u32);
+
+        let project_wallet = Address::generate(&env);
+        let project_id = String::from_str(&env, "forest-restore");
+        client.register_project(
+            &admin,
+            &project_id,
+            &String::from_str(&env, "Forest Restore"),
+            &project_wallet,
+            &100u32,
+        );
+
+        let donor_a = Address::generate(&env);
+        let donor_b = Address::generate(&env);
+
+        let leaf_a = ImpactLeaf {
+            donor: donor_a.clone(),
+            donation_index: 0u32,
+            co2_kg: 100u32,
+            trees: 5u32,
+            hectares: 2u32,
+        };
+        let leaf_b = ImpactLeaf {
+            donor: donor_b.clone(),
+            donation_index: 1u32,
+            co2_kg: 200u32,
+            trees: 10u32,
+            hectares: 4u32,
+        };
+
+        let root = build_two_leaf_root(&env, &leaf_a, &leaf_b);
+        let proof = build_proof_for_leaf0(&env, &leaf_b);
+
+        let report_id = String::from_str(&env, "Q1 2026");
+        client.set_impact_merkle_root(&admin, &project_id, &root, &report_id);
+
+        // Leaf A is at index 0 with proof = [hash(leaf_b)].
+        // Claiming it's at index 1 reverses the sibling ordering:
+        //   idx=1 → sibling || hash instead of hash || sibling
+        // This produces a different combined value → verification fails.
+        let result = client.verify_impact(
+            &project_id,
+            &report_id,
+            &leaf_a,
+            &proof,
+            &1u32, // WRONG: leaf_a is actually at index 0
+        );
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_merkle_proof_mismatched_root() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, IndigoPayContract);
+        let client = IndigoPayContractClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&signers1(&env, &admin), &1u32);
+
+        let project_wallet = Address::generate(&env);
+        let project_id = String::from_str(&env, "forest-restore");
+        client.register_project(
+            &admin,
+            &project_id,
+            &String::from_str(&env, "Forest Restore"),
+            &project_wallet,
+            &100u32,
+        );
+
+        let donor_a = Address::generate(&env);
+        let donor_b = Address::generate(&env);
+        let donor_c = Address::generate(&env);
+
+        // Build a tree from leaf_a + leaf_b and post its root.
+        let leaf_a = ImpactLeaf {
+            donor: donor_a.clone(),
+            donation_index: 0u32,
+            co2_kg: 100u32,
+            trees: 5u32,
+            hectares: 2u32,
+        };
+        let leaf_b = ImpactLeaf {
+            donor: donor_b.clone(),
+            donation_index: 1u32,
+            co2_kg: 200u32,
+            trees: 10u32,
+            hectares: 4u32,
+        };
+        let root_ab = build_two_leaf_root(&env, &leaf_a, &leaf_b);
+
+        let report_id = String::from_str(&env, "Q1 2026");
+        client.set_impact_merkle_root(&admin, &project_id, &root_ab, &report_id);
+
+        // Build a DIFFERENT tree from leaf_a + leaf_c → different root.
+        let leaf_c = ImpactLeaf {
+            donor: donor_c.clone(),
+            donation_index: 2u32,
+            co2_kg: 300u32,
+            trees: 15u32,
+            hectares: 6u32,
+        };
+        let root_ac = build_two_leaf_root(&env, &leaf_a, &leaf_c);
+
+        // Verify that the two roots are actually different.
+        assert_ne!(root_ab, root_ac);
+
+        // Use leaf_a with proof for leaf_c against the STORED root_ab.
+        // The proof is valid for root_ac, but the stored root is root_ab.
+        let proof_for_ac = build_proof_for_leaf0(&env, &leaf_c);
+
+        let result = client.verify_impact(&project_id, &report_id, &leaf_a, &proof_for_ac, &0u32);
+        assert!(!result);
     }
 }

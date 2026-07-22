@@ -166,6 +166,8 @@ export default function ProjectAdmin() {
     for (const d of donations) {
       const donorAddress =
         d.anonymous || !d.donorAddress ? "Anonymous" : d.donorAddress;
+      const donorAddress = d.donorAddress;
+      if (!donorAddress) continue;
       const amount = parseFloat(d.amountXLM || d.amount || "0");
       const curr = byDonor.get(donorAddress) || {
         donorAddress,
@@ -680,6 +682,7 @@ export default function ProjectAdmin() {
                   <div>
                     <p className="text-sm font-semibold text-forest-900 font-body">
                       {d.anonymous || !d.donorAddress ? "Anonymous" : shortenAddress(d.donorAddress)} •{" "}
+                      {shortenAddress(d.donorAddress || "")} •{" "}
                       {formatXLM(d.amountXLM || d.amount || "0", 2)}
                     </p>
                     <p className="text-xs text-[#8aaa8a] dark:text-forest-300 font-body">

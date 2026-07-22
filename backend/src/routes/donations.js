@@ -26,6 +26,7 @@ const { enqueuePushNotification } = require("../services/pushQueue");
 const { server } = require("../services/stellar");
 const oracleService = require("../services/oracleService");
 const { generateReceiptPdf, hashReceiptContent, signReceipt } = require("../services/receiptGenerator");
+const { invalidateProjectRelatedCache } = require("../services/cacheManager");
 const donationLimiter = createRateLimiter(10, 1); // 10 requests per minute
 
 // Local EventEmitter used by both the POST /api/donations handler and the
@@ -258,6 +259,14 @@ async function recordDonation(req, res, next) {
         "Failed to enqueue profile update job",
       );
     });
+    if (!anonymous) {
+      enqueueProfileUpdate(donorAddress).catch((err) => {
+        logger.error(
+          { event: "profile_update_enqueue_failed", err, donorAddress },
+          "Failed to enqueue profile update job",
+        );
+      });
+    }
 
     enqueueImpactRecalc({
       donationId: recordedDonation.id,
@@ -305,6 +314,8 @@ async function recordDonation(req, res, next) {
         timestamp: new Date().toISOString(),
       });
     }
+
+    await invalidateProjectRelatedCache(projectId);
 
     const mappedDonation = mapDonationRow(donationResult.rows[0]);
     if (anonymous) mappedDonation.donorAddress = null;
