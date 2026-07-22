@@ -252,6 +252,9 @@ async function recordDonation(req, res, next) {
     inTransaction = false;
 
     if (!anonymous) enqueueProfileUpdate(donorAddress).catch((err) => {
+    // Fire-and-forget: enqueue profile update + donation matching.
+    // Neither failure should roll back the donation itself.
+    enqueueProfileUpdate(donorAddress).catch((err) => {
       logger.error(
         { event: "profile_update_enqueue_failed", err, donorAddress },
         "Failed to enqueue profile update job",
