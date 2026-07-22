@@ -1617,8 +1617,26 @@ impl IndigoPayContract {
     ) {
         require_not_paused(&env);
 
+        // ── Auth check: verify each unique donor once, before processing
+        //    This avoids Soroban's "ExistingValue" auth conflict when calling
+        //    require_auth() inside the loop.
+        let mut verified_donors: Vec<Address> = Vec::new(&env);
         for donation in donations.iter() {
-            donation.donor.require_auth();
+            let mut already_verified = false;
+            for verified in verified_donors.iter() {
+                if verified == &donation.donor {
+                    already_verified = true;
+                    break;
+                }
+            }
+            if !already_verified {
+                donation.donor.require_auth();
+                verified_donors.push_back(donation.donor.clone());
+            }
+        }
+
+        // ── Process each donation
+        for donation in donations.iter() {
             if donation.amount <= 0 {
                 panic!("Donation amount must be positive");
             }
