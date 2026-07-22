@@ -296,12 +296,7 @@ impl EscrowContract {
     /// Oracle verifies a milestone proof and marks it as verified.
     /// Only the oracle configured on the milestone can call this.
     #[cfg(feature = "oracle-escrow")]
-    pub fn verify_milestone(
-        env: Env,
-        oracle: Address,
-        job_id: String,
-        milestone_index: u32,
-    ) {
+    pub fn verify_milestone(env: Env, oracle: Address, job_id: String, milestone_index: u32) {
         oracle.require_auth();
 
         let mut job: Job = env
@@ -1541,7 +1536,14 @@ mod tests {
                 proof_hash: None,
             });
 
-            client.create_job(client_addr, freelancer, &job_id, &token, &1000i128, &milestones);
+            client.create_job(
+                client_addr,
+                freelancer,
+                &job_id,
+                &token,
+                &1000i128,
+                &milestones,
+            );
             (job_id, token)
         }
 
@@ -1556,7 +1558,11 @@ mod tests {
             let oracle = Address::generate(&env);
 
             let (job_id, _token) = setup_oracle_job(
-                &env, &client, &client_addr, &freelancer, Some(oracle.clone()),
+                &env,
+                &client,
+                &client_addr,
+                &freelancer,
+                Some(oracle.clone()),
             );
 
             let proof = BytesN::from_array(&env, &[42u8; 32]);
@@ -1582,7 +1588,11 @@ mod tests {
             let oracle = Address::generate(&env);
 
             let (job_id, _token) = setup_oracle_job(
-                &env, &client, &client_addr, &freelancer, Some(oracle.clone()),
+                &env,
+                &client,
+                &client_addr,
+                &freelancer,
+                Some(oracle.clone()),
             );
 
             let proof = BytesN::from_array(&env, &[1u8; 32]);
@@ -1600,9 +1610,7 @@ mod tests {
             let client_addr = Address::generate(&env);
             let freelancer = Address::generate(&env);
 
-            let (job_id, _token) = setup_oracle_job(
-                &env, &client, &client_addr, &freelancer, None,
-            );
+            let (job_id, _token) = setup_oracle_job(&env, &client, &client_addr, &freelancer, None);
 
             // No proof, no verification — release should succeed as before
             client.release_milestone(&client_addr, &job_id, &0u32);
@@ -1623,7 +1631,11 @@ mod tests {
             let oracle = Address::generate(&env);
 
             let (job_id, _token) = setup_oracle_job(
-                &env, &client, &client_addr, &freelancer, Some(oracle.clone()),
+                &env,
+                &client,
+                &client_addr,
+                &freelancer,
+                Some(oracle.clone()),
             );
 
             let proof = BytesN::from_array(&env, &[99u8; 32]);
