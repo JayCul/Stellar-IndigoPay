@@ -390,6 +390,9 @@ mod fuzz {
                 percentage: pct,
                 released: false,
                 disputed: false,
+                oracle: None,
+                verified: false,
+                proof_hash: None,
             });
         }
         milestones
