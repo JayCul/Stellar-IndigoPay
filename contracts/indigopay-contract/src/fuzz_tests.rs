@@ -51,7 +51,7 @@ mod fuzz {
         let client = IndigoPayContractClient::new(&env, &cid);
 
         let admin = Address::generate(&env);
-        client.initialize(&admin);
+        client.initialize(&soroban_sdk::vec![&env, admin.clone()], &1u32);
 
         let project_id = SorobanString::from_str(&env, "proj-usdc-fuzz");
         let wallet = Address::generate(&env);
@@ -95,7 +95,7 @@ mod fuzz {
         let client = IndigoPayContractClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize(&admin);
+        client.initialize(&soroban_sdk::vec![&env, admin.clone()], &1u32);
 
         let project_id = SorobanString::from_str(&env, "proj-fuzz-1");
         let wallet = Address::generate(&env);
@@ -302,7 +302,7 @@ mod fuzz {
             let cid = env.register_contract(None, IndigoPayContract);
             let client = IndigoPayContractClient::new(&env, &cid);
             let admin = Address::generate(&env);
-            client.initialize(&admin);
+            client.initialize(&soroban_sdk::vec![&env, admin.clone()], &1u32);
 
             let project_id = SorobanString::from_str(&env, "proj-inactive");
             let wallet = Address::generate(&env);
@@ -340,7 +340,7 @@ mod fuzz {
                 min..=max
             },
         ) {
-            let (env, client, project_id, usdc_token) = setup_usdc(u32::MAX);
+            let (env, client, project_id, usdc_token) = setup_usdc(100_000);
             let donor = Address::generate(&env);
             fund_usdc(&env, &usdc_token, &donor, usdc_amount);
 

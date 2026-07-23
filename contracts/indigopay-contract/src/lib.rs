@@ -4,6 +4,9 @@
 // TODO(indigopay-272): migrate to #[contractevent] pattern.
 #![allow(deprecated)]
 
+#[cfg(all(test, feature = "testutils"))]
+mod fuzz_tests;
+
 #[cfg(feature = "donation")]
 pub mod donation;
 
