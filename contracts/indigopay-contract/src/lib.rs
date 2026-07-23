@@ -1679,7 +1679,15 @@ impl IndigoPayContract {
             panic!("Donation amount must be positive");
         }
 
-        process_donation(&env, &token, &donor, &project_id, amount, msg_hash, anonymous);
+        process_donation(
+            &env,
+            &token,
+            &donor,
+            &project_id,
+            amount,
+            msg_hash,
+            anonymous,
+        );
         ensure_min_ttl(&env, VOTING_WINDOW_LEDGERS * 4);
     }
 
